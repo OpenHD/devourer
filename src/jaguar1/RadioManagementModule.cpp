@@ -10,7 +10,7 @@ extern "C" {
 
 #include <chrono>
 #include <cstdlib>
-#include <map>
+#include <array>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -838,35 +838,36 @@ constexpr uint16_t rD_SIRead_8814A = 0xdC8;
 constexpr uint16_t rC_PIRead_8814A = 0xd84;
 constexpr uint16_t rD_PIRead_8814A = 0xdC4;
 
-std::map<RfPath, BbRegisterDefinition> PhyRegDef = {
-    {RfPath::RF_PATH_A,
+constexpr std::array<BbRegisterDefinition, 4> kPhyRegDef = {{
      {
          .Rf3WireOffset = rA_LSSIWrite_Jaguar,
          .RfHSSIPara2 = rHSSIRead_Jaguar,
          .RfLSSIReadBack = rA_SIRead_Jaguar,
          .RfLSSIReadBackPi = rA_PIRead_Jaguar,
-     }},
-    {RfPath::RF_PATH_B,
+     },
      {
          .Rf3WireOffset = rB_LSSIWrite_Jaguar,
          .RfHSSIPara2 = rHSSIRead_Jaguar,
          .RfLSSIReadBack = rB_SIRead_Jaguar,
          .RfLSSIReadBackPi = rB_PIRead_Jaguar,
-     }},
-    {RfPath::RF_PATH_C,
+     },
      {
          .Rf3WireOffset = rC_LSSIWrite_8814A,
          .RfHSSIPara2 = rHSSIRead_Jaguar,
          .RfLSSIReadBack = rC_SIRead_8814A,
          .RfLSSIReadBackPi = rC_PIRead_8814A,
-     }},
-    {RfPath::RF_PATH_D,
+     },
      {
          .Rf3WireOffset = rD_LSSIWrite_8814A,
          .RfHSSIPara2 = rHSSIRead_Jaguar,
          .RfLSSIReadBack = rD_SIRead_8814A,
          .RfLSSIReadBackPi = rD_PIRead_8814A,
-     }}};
+     },
+}};
+
+const BbRegisterDefinition& phy_reg_def(RfPath path) {
+  return kPhyRegDef.at(static_cast<std::size_t>(path));
+}
 
 uint32_t RadioManagementModule::phy_query_bb_reg(uint16_t regAddr,
                                                  uint32_t bitMask) {
@@ -919,7 +920,7 @@ uint32_t RadioManagementModule::phy_RFSerialRead(RfPath eRFPath,
 
   uint32_t retValue;
 
-  BbRegisterDefinition pPhyReg = PhyRegDef[eRFPath];
+  const BbRegisterDefinition& pPhyReg = phy_reg_def(eRFPath);
   bool bIsPIMode = false;
 
   /* <20120809, Kordan> CCA OFF(when entering), asked by James to avoid reading
@@ -966,7 +967,7 @@ uint32_t RadioManagementModule::phy_RFSerialRead(RfPath eRFPath,
 
 void RadioManagementModule::phy_RFSerialWrite(RfPath eRFPath, uint32_t Offset,
                                               uint32_t Data) {
-  BbRegisterDefinition pPhyReg = PhyRegDef[eRFPath];
+  const BbRegisterDefinition& pPhyReg = phy_reg_def(eRFPath);
 
   Offset &= 0xff;
   /* Shadow Update */

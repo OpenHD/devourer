@@ -67,8 +67,12 @@ bool FhssSession::wait_until_us(const int64_t target_us) {
   while (running_.load()) {
     const auto remaining = target_us - now_us();
     if (remaining <= 0) return true;
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(std::min<int64_t>(remaining, 1000)));
+    if (remaining > 2000) {
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(remaining - 1500));
+    } else {
+      std::this_thread::yield();
+    }
   }
   return false;
 }
@@ -171,8 +175,10 @@ void FhssSession::follower_loop() {
       anchor = anchor_us_;
       last_marker = last_marker_us_;
     }
+    const int64_t lock_loss_timeout_us =
+        std::max<int64_t>(30 * slot_us, int64_t{2000000});
     const bool tracking = anchor > 0 && last_marker > 0 &&
-                          now - last_marker < 3 * slot_us;
+                          now - last_marker < lock_loss_timeout_us;
     if (tracking) {
       if (!had_lock) had_lock = true;
       const uint64_t slot = static_cast<uint64_t>(std::max<int64_t>(0, now - anchor) /

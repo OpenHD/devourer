@@ -193,6 +193,9 @@ add_library(devourer
     src/TxPower.cpp
     src/TxPower.h
     src/TxStats.h
+    src/FhssSession.cpp
+    src/FhssSession.h
+    src/HopSchedule.h
     src/ThermalStatus.h
     src/TxCaps.h
     src/LinkHealth.cpp
@@ -1015,6 +1018,15 @@ add_executable(RxQualitySelftest
 target_link_libraries(RxQualitySelftest PRIVATE devourer)
 
 add_test(NAME rx_quality_derive COMMAND RxQualitySelftest)
+
+# Reusable lockstep FHSS session used by integrations such as OpenHD.  This
+# keeps the hop clock, acquisition scan and sync-marker handling in Devourer
+# instead of making every consumer copy the example programs' timing loops.
+add_executable(FhssSessionSelftest
+    tests/fhss_session_selftest.cpp
+)
+target_link_libraries(FhssSessionSelftest PRIVATE devourer)
+add_test(NAME fhss_session_lockstep COMMAND FhssSessionSelftest)
 
 # Headless guard for the TX-capability derivation (src/TxCaps.h) — the
 # STBC-needs-2-chains rule the send_packet 1T1R guard relies on.

@@ -1032,7 +1032,7 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                    (int)length);
     return actual;
   }
-  _logger->info("bulk_send EP {} OK {} bytes", (int)ep, actual);
+  _logger->trace("bulk_send EP {} OK {} bytes", (int)ep, actual);
   return actual;
 }
 

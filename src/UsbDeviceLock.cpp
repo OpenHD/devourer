@@ -1,9 +1,9 @@
 #include "UsbDeviceLock.h"
 
-#if defined(__ANDROID__) || defined(_MSC_VER) || defined(__APPLE__)
-#include <libusb.h>
-#else
+#if defined(__has_include) && __has_include(<libusb-1.0/libusb.h>)
 #include <libusb-1.0/libusb.h>
+#else
+#include <libusb.h>
 #endif
 
 #include <cstdint>

@@ -158,6 +158,7 @@ endif()
 
 # Find pkg-config and then use it to locate libusb.
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
 
 add_library(devourer
@@ -598,7 +599,7 @@ add_executable(txdemo
     examples/tx/main.cpp
     examples/common/env_config.cpp
 )
-target_link_libraries(txdemo PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_link_libraries(txdemo PUBLIC devourer PRIVATE PkgConfig::libusb Threads::Threads atomic)
 target_include_directories(txdemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
 # dwell-1 A/B injection over the firmware channel switch (issue #272 data

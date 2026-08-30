@@ -518,8 +518,10 @@ int main(int argc, char **argv) {
     session.adopt_context(context);
   } else if (termux_mode) {
     logger->info("Termux mode: wrapping fd {}", fd);
+#if defined(__ANDROID__)
     libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
     libusb_set_option(NULL, LIBUSB_OPTION_WEAK_AUTHORITY);
+#endif
     rc = libusb_init(&context);
     session.adopt_context(context);
     rc = libusb_wrap_sys_device(context, (intptr_t)fd, &handle);

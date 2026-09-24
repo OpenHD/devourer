@@ -11,7 +11,7 @@
  * there is one source of truth per fact. Like those, it is STATIC — resolved at
  * construction, safe from any thread, callable before Init/InitWrite. The live
  * "which antennas look connected" question is deliberately NOT here (it needs
- * traffic); see IRtlDevice::GetActiveRxPaths / ActiveRxPaths in RxQuality.h.
+ * traffic); see IRadio::GetActiveRxPaths / ActiveRxPaths in RxQuality.h.
  *
  * FREQUENCY COVERAGE. The 5 GHz synthesizer on these parts tunes well past the
  * regulatory UNII channels (the vendor rtl88x2bu "monitor_chan_override" hack:
@@ -39,7 +39,12 @@ enum class ChipGeneration : uint8_t {
   Jaguar2,
   Jaguar3,
   Rtl8733b, /* HALMAC 87xx 802.11n: RTL8731BU / RTL8733BU */
-  Kestrel /* Wi-Fi 6 / 802.11ax (RTL8852BU/8852CU) */
+  Kestrel,  /* Wi-Fi 6 / 802.11ax (RTL8852BU/8852CU) */
+  /* MediaTek MT7662 MAC (MT7612U / MT7662U, 2T2R 11ac USB) — the first
+   * non-Realtek generation. Register width, the vendor-request opcodes and the
+   * in-band MCU plane all differ; nothing that switches on this value may
+   * assume a Realtek register map. */
+  Mt7612u
 };
 
 inline const char *generation_name(ChipGeneration g) {
@@ -54,6 +59,8 @@ inline const char *generation_name(ChipGeneration g) {
     return "rtl8733b";
   case ChipGeneration::Kestrel:
     return "kestrel";
+  case ChipGeneration::Mt7612u:
+    return "mt7612u";
   default:
     return "unknown";
   }
@@ -83,8 +90,15 @@ inline uint8_t bw_mask_for_generation(ChipGeneration g) {
   /* RTL8733B: 10 MHz qualified (SDR OBW + two-way cross-decode with a
    * Jaguar3 peer, both bands); 5 MHz is refused — its BB small-BW mode airs
    * no packets on this die (docs/rtl8733b.md "Narrowband status"). */
+  /* MT7612U: 20/40/80 and nothing narrower. MT_RATE_BW encodes only
+   * 20/40/80/160, so there is no 5 or 10 MHz to select — unlike the Realtek
+   * BB small-BW modes the trailing arm below is describing. Named explicitly
+   * because that trailing arm is the permissive one: without this case a
+   * MediaTek adapter would inherit kBw5|kBw10 and advertise two bandwidths the
+   * part cannot represent. 160 MHz is likewise absent (docs/mt7612u.md). */
   return g == ChipGeneration::Rtl8733b ? (kBw10 | kBw20 | kBw40)
          : g == ChipGeneration::Jaguar1  ? ac
+         : g == ChipGeneration::Mt7612u  ? ac
          : g == ChipGeneration::Unknown ? 0
                                         : (ac | kBw5 | kBw10);
 }
@@ -171,16 +185,44 @@ struct AdapterCaps {
    * ack_responder_ok: SetAckResponder measurably closes a hardware-ARQ loop
    * as the RESPONDER (SIFS ACKs that a soliciting TX's CCX reports confirm).
    * Measured true: 8812A (works, degraded — intermittent SIFS ACKs), 8814A,
-   * 8821A (61–64% single-shot MCS3, 94% at retry 8, disarm-proof-verified —
-   * an earlier "broken" verdict was a harness artifact: the responder's arm
-   * was never verified, so a silently dead responder read as on=0/off=0),
+   * 8821A (61–64% single-shot MCS3, 94% at retry 8 — an earlier "broken"
+   * verdict was a harness artifact: the responder's arm was never verified,
+   * so a silently dead responder read as on=0/off=0),
    * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
-   * inherits its row). False-as-unmeasured (the
+   * inherits its row), 8733B (1725/1725 frames ACKed at retries_mean 0.00,
+   * and retarget-proof: re-armed on a different MAC, 1728/1728 —
+   * tests/ack_txreport_matrix.sh run with the 8733B as the responder).
+   *
+   * The `on`, `retarget`, and legacy `off` rows establish arming, retargeting,
+   * and a never-armed control. A backend-owned `disarmed` row supports only
+   * the live-disarm claim for the responder used in that run. On the reference
+   * RTL8812AU, the old gate-only clear left every soliciting report ACKed;
+   * restoring the captured pre-arm MACID produced no ACKs with retries pinned
+   * at the configured limit. The own-MAC adversary also showed why an arm equal
+   * to the captured MACID must be refused. docs/scheduled-mac.md owns the exact
+   * counts. The implementation additionally restores and readback-verifies
+   * BSSID as port-state hygiene; the ACK-rate result does not attribute the
+   * behavioral change to BSSID. The implementation covers the shared CHIP_8812
+   * path, but its 1T1R RTL8811AU cut was not separately measured; 8814A/8821A
+   * and the HalMAC generations do not inherit the result.
+   *
+   * On the 8733B the net_type gate is INERT and the engine matches MACID
+   * alone: at single-shot ACK rate a never-armed port answers on its own EFUSE
+   * MAC at 85.2%/82.5% against 0.0% for an address nobody holds, and 83.3%
+   * when deliberately armed. Two consequences: every never-armed monitor
+   * session on that die already auto-ACKs unicast to its own MAC, and a disarm
+   * there can only move the identity, never silence the port
+   * (Rtl8733bDevice::disarm_ack_responder). Not known to hold on any other
+   * generation — the AP-mode work proved the gate where it was measured.
+   * False-as-unmeasured (the
    * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
    * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:
    * SetAckResponder is not implemented on the AX generation.
    * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
-   * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; Kestrel
+   * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; the 8733B
+   * by airtime dose-response instead, 0/3/12 -> 1.00/4.00/12.32–12.33 airings per
+   * frame, because that die has no CCX path to judge its own frames
+   * (tests/rtl8733b_retry_limit_onair.sh); Kestrel
    * 8832CU witness-measured — the AX WD DATA_TXCNT_LMT field counts
    * ATTEMPTS, folded +1 to the N-retries contract, limits {0,2,8} -> modal
    * on-air copies {1,3,8-9}). FALSE on the 8814A die (the vendor
@@ -227,6 +269,46 @@ struct AdapterCaps {
    * equivalent. */
   bool he_er_su_ok = false;
   bool per_chain_rssi = false;     /* frame parser fills per-chain rssi (>=2ch) */
+
+  /* Frame-free sensing. These exist because a successful
+   * dynamic_cast<IRtlRadio*> is not a correct discriminator and never was: the
+   * RTL8733B derives from IRtlRadio and implements no GetRxEnergy at all, so
+   * the cast reports a sensor that returns nothing.
+   *
+   * The two flags below are also independent of each other, and the RTL8733B
+   * is where that stops being theoretical: it has a working CCX CLM engine
+   * and no phydm FA/CCA block, so busy_airtime_ok is true while rx_energy_ok
+   * is false. Do not read either from the other.
+   *
+   * busy_airtime_ok: the backend HAS a hardware busy-airtime engine that
+   * IRadio::GetChannelBusy can report — the Realtek CCX CLM engine
+   * (Jaguar1/2/3 and the RTL8733B, which the vendor phydm puts on the JGR3
+   * map) or the MediaTek MAC channel timers. FALSE on Kestrel, whose NHM
+   * rides the halbb glue rather than NhmReader, so it has no CLM.
+   *
+   * It does NOT promise that an unarmed GetChannelBusy() answers. On the
+   * RTL8733B it does not: that backend feeds its sampled path from
+   * GetRxEnergy, which it does not implement, so an unarmed call reports no
+   * reading and IRadio::ArmChannelBusy is the only way to get a number out of
+   * it. A consumer that wants a reading from an arbitrary backend should arm
+   * rather than sample; one that samples must handle "no reading" from a
+   * backend whose flag is true.
+   *
+   * busy_airtime_measured: that reading has been separated from a quiet
+   * channel ON AIR for this family, not merely implemented. The harness is
+   * tests/busy_window_probe.sh, which pits an armed window against the quiet
+   * floor under a known load, and against each way a window can be spoiled.
+   * True today on all five backends that set busy_airtime_ok. The flag stays
+   * because the two facts are independent: a port can land the engine before
+   * anyone has run it on air, and false-as-unmeasured is the house rule for
+   * that state.
+   *
+   * rx_energy_ok: IRtlRadio::GetRxEnergy returns real phydm FA/CCA/IGI
+   * counters. Always false on a non-Realtek radio; false on the RTL8733B and
+   * Kestrel, which is exactly the false positive the cast produced. */
+  bool busy_airtime_ok = false;
+  bool busy_airtime_measured = false;
+  bool rx_energy_ok = false;
   /* Hardware timing. hw_rx_timestamp: every received frame is stamped with the
    * MAC's microsecond TSF at receive (RxPacket.RxAtrib.tsfl) — true on all
    * generations. hw_beacon_txtsf: this adapter, as a transmitter, inserts its
@@ -234,9 +316,21 @@ struct AdapterCaps {
    * (a genuine sub-µs TX-egress timestamp a receiver reads via
    * Packet::TxEgressTsf) — rides the hardware beacon function (StartBeacon);
    * true on all generations. Together they are the primitives for one-way
-   * hardware time distribution (see TsfSync). */
+   * hardware time distribution (see TsfSync). tsf_write_ok: IRadio::WriteTsf
+   * drives a standalone write the part's counter loads (the static half of the
+   * WriteTsf contract; its bool return is the per-call transport result).
+   * Readback-measured through WriteTsf: 8822B (Jaguar2; incl. an RTL8812BU,
+   * 40/40 forward and backward writes landed), 8822C (Jaguar3). The
+   * 8821AU (Jaguar1) is measured on the raw REG_TSFTR pair with a scratch probe
+   * (both word orders, no beacon armed), which is exactly what the Jaguar1
+   * WriteTsf writes; the override itself has not run on Jaguar1 hardware. The
+   * 8812A/8814A, 8821C (USB and PCIe) and 8822E ride the same pair and code
+   * path and are not separately measured. FALSE on the MT7612U (measured: its DW0/DW1 registers
+   * do not load the counter, docs/mt7612u.md), and on Kestrel and the RTL8733B
+   * (no TSF write in the source — not a bench fact). */
   bool hw_rx_timestamp = false;
   bool hw_beacon_txtsf = false;
+  bool tsf_write_ok = false;
   /* 802.11ax scheduled UL (Kestrel/RTL8852 only). trigger_ul_ok: the adapter
    * can air an HE Trigger frame (UL-OFDMA grant) and program the fw UL-OFDMA
    * scheduler (SendTrigger / ConfigureUlOfdma). twt_ok: the fw exposes the TWT

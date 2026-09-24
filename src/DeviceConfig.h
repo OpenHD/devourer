@@ -1,9 +1,9 @@
 #pragma once
 
 /* DeviceConfig — construction-time configuration, passed to
- * WiFiDriver::CreateRtlDevice (defaulted: CreateRtlDevice(handle) gives stock
+ * WiFiDriver::CreateRadio (defaulted: CreateRadio(handle) gives stock
  * behaviour). Fields are fixed for the device's lifetime; knobs that change
- * mid-session are runtime setters on IRtlDevice / the concrete device classes
+ * mid-session are runtime setters on IRadio / the concrete device classes
  * (SetTxMode, SetTxPowerOffsetQdb, SetRxPathMask, SetCcaMode, ...).
  *
  * The example binaries populate this from DEVOURER_* environment variables via
@@ -117,7 +117,9 @@ struct DeviceConfig {
   struct Rx {
     /* env: DEVOURER_RX_KEEP_CORRUPTED — pass frames that fail the 802.11 FCS
      * (CRC32) or decryption-ICV check up to the host instead of dropping them
-     * at the WMAC filter (sets RCR ACRC32|AICV). Jaguar1 + Jaguar2. */
+     * at the MAC RX filter (Realtek: RCR ACRC32|AICV; MT7612U: its monitor
+     * RX filter). Jaguar1, Jaguar2, Jaguar3, the RTL8733B and the MT7612U;
+     * not ported on Kestrel, where it is silently inert. */
     bool keep_corrupted = false;
     /* env: DEVOURER_TX_WITH_RX — Jaguar3 only: keep the RX filters open and
      * enable the RX path during a TX (InitWrite) bring-up so StartRxLoop can
@@ -186,7 +188,9 @@ struct DeviceConfig {
      * responder at the end of bring-up (src/AckResponder.h): the MAC
      * auto-ACKs unicast frames addressed to this MAC while monitor RX and
      * injection continue unchanged. Runtime equivalent: SetAckResponder /
-     * ClearAckResponder. OPT-IN: makes a passive monitor transmit. */
+     * ClearAckResponder. Retargeting hardware responses to a caller-supplied
+     * address is opt-in; some dies, notably RTL8733B, may already answer for
+     * the initialization MAC before this option is set. */
     std::optional<MacAddr> ack_responder;
   } rx;
 
@@ -216,7 +220,8 @@ struct DeviceConfig {
     /* env: DEVOURER_TX_RETRY_LIMIT — per-frame hardware retry limit (0..63;
      * Kestrel ceiling 62 — its attempts-counting WD field folds +1). Maps to
      * the TX descriptor DATA_RETRY_LIMIT / RTS_DATA_RTY_LMT field on the
-     * 11ac generations and wd_info DATA_TXCNT_LMT on Kestrel. 0 = no retries
+     * 11ac generations and the RTL8733B, and wd_info DATA_TXCNT_LMT on
+     * Kestrel. 0 = no retries
      * (WFB default: FEC provides reliability, not MAC retries). On a busy
      * half-duplex link retries flood the air and blind the receiver.
      * Hardware-ARQ (SetAckResponder + unicast TA, docs/scheduled-mac.md)
@@ -234,16 +239,19 @@ struct DeviceConfig {
      * per-bandwidth vendor value is 117 µs), so it also replaces the
      * per-chip / per-bandwidth vendor defaults (which ranged 33..128 µs
      * and made hardware-ARQ range silently die-dependent). The register:
-     * REG_ACKTO 0x640 on the 11ac generations, R_AX_RSP_CHK_SIG 0xCC00
-     * byte0 on Kestrel; the CTS window (REG_CTS2TO 0x641) is separate and
-     * untouched. Sizing: ~6.7 µs x round-trip km + ~50 µs ACK flight and
-     * detection margin; a longer window is NOT free — every retry of a
-     * LOST frame waits the full window, measured (dead RA, retry 8, max
+     * REG_ACKTO 0x640 on the 11ac generations; RTL8733B programs both 0x640
+     * (OFDM/HT) and its CCK companion 0x639. Kestrel uses
+     * R_AX_RSP_CHK_SIG 0xCC00 byte0. The CTS window (REG_CTS2TO 0x641) is
+     * separate and untouched. Sizing: ~6.7 µs x round-trip km plus ~50 µs
+     * ACK flight/detection margin; a longer window is NOT free — every retry
+     * of a LOST frame waits the full window, measured (dead RA, retry 8, max
      * duty): 2719 write-offs/8 s at 33 µs vs 2015 at 128 vs 1507 at 255.
      * Bench proof the register gates the ARQ verdict: at 8 µs (below the
      * ACK's flight time) retries pin at the limit with 0% ok against a
      * live responder; at 128/255 the responder cell runs 100% ok,
-     * retries ~0. */
+     * retries ~0. RTL8733B CCK direction check (11M, dead RA, retry 8,
+     * max duty, 8 s): 1513 submissions at 33 µs versus 1129 at 200 µs;
+     * this establishes that the CCK window is live, not precise timing. */
     int ack_timeout_us = 128;
     /* env: DEVOURER_TX_RETRY_FALLBACK — "off" | unset. Unset = the firmware
      * fallback ladder with its own floor (the current behaviour, descriptors
@@ -265,7 +273,9 @@ struct DeviceConfig {
      * `tx.report` events. The TX-side link sensor. On the HalMAC chips the
      * descriptor SW_DEFINE also carries a rotating 8-bit tag the report
      * echoes (per-frame correlation). Default off (descriptors
-     * byte-identical). Needs an RX loop to deliver the C2H reports.
+     * byte-identical). Needs an RX loop to deliver the C2H reports. RTL8733B
+     * is an explicit exception: its backend has no H2C/MEDIA_STATUS_RPT path,
+     * warns that the request is unsupported, and emits no `tx.report` events.
      *
      * Value = sampling divisor N: 1 requests a report on EVERY frame, N > 1
      * on every Nth (0..255). The CCX emission path saturates at ~1.3–1.4 k
@@ -395,7 +405,7 @@ struct DeviceConfig {
      * (stub default 0xa/0xb). */
     std::optional<uint8_t> nb_adc;
     /* env: DEVOURER_XTAL_CAP — crystal-cap trim code applied at the end of
-     * bring-up (IRtlDevice::SetXtalCap). The CFO lever for narrowband at the
+     * bring-up (IRtlRadio::SetXtalCap). The CFO lever for narrowband at the
      * edge of its budget; unset = efuse/default. Raw code, 0..0x3f (Jaguar1/2)
      * or 0..0x7f (Jaguar3). */
     std::optional<uint8_t> xtal_cap;
@@ -528,6 +538,38 @@ struct DeviceConfig {
      * (DEVOURER_PCIE_BDF) is likewise demo-local, like USB device selection. */
     std::optional<int> rx_poll_us;
   } pcie;
+
+  /* ---- MediaTek MT7612U (DEVOURER_MT7612U builds) ---------------------- */
+  struct Mt7612u {
+    /* env: DEVOURER_MT7612U_FW_DIR — directory holding mt7662_rom_patch.bin
+     * and mt7662.bin. Unset = search /lib/firmware/mediatek then ./firmware.
+     *
+     * A path rather than an embedded blob, unlike every Realtek backend: this
+     * firmware ships in linux-firmware under its own licence rather than being
+     * generated into hal/, and it is zstd-compressed on most distributions, so
+     * it can be neither vendored here nor assumed ready at a fixed path.
+     * Decompress both and point this at the directory.
+     *
+     * Here rather than a getenv inside the backend so the library and the
+     * device class both stay free of ambient process state; the demos fold the
+     * variable in, the way they do for every other knob in this file. */
+    std::optional<std::string> firmware_dir;
+    /* env: DEVOURER_MT7612U_PHY_TICK — 0 disables the backend's 1 Hz PHY tick
+     * (MCU channel calibration + temperature calibration + RX gain tracking,
+     * mt7612u_phy_tick()). Measurement control only: without the tick a
+     * receiver under a fast peer collapses to a few frames per 10 s
+     * (docs/mt7612u.md), so the only reason to turn it off is to measure that
+     * arm - the benchmark that says whether some other periodic reader (a
+     * channel-busy poller, say) is disturbing the tick has no meaning without
+     * the no-tick control beside it. Default on. */
+    bool phy_tick = true;
+    /* No adapter selector here on purpose. devourer chooses the adapter before
+     * a backend exists (DEVOURER_USB_BUS / _PORT / _VID / _PID) and hands the
+     * backend an already-claimed handle, so a MediaTek-specific selector would
+     * be read by nothing. The C library's own mt7612u_open_selected() is for a
+     * consumer that opens the device itself; MT7612U_DEV drives the bring-up
+     * tool, not devourer. */
+  } mt7612u;
 };
 
 } // namespace devourer

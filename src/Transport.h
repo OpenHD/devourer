@@ -1,6 +1,6 @@
 #pragma once
 
-/* IRtlTransport — the bus seam. USB (libusb) and PCIe (vfio) are independent
+/* ITransport — the bus seam. USB (libusb) and PCIe (vfio) are independent
  * transports implementing this one interface; RtlAdapter (the copyable value
  * type every HAL holds) owns a shared_ptr to one of them and forwards. Nothing
  * here depends on libusb or vfio.
@@ -39,9 +39,9 @@ struct UsbLinkInfo {
   std::vector<uint8_t> bulk_out_eps; /* descriptor order */
 };
 
-class IRtlTransport {
+class ITransport {
 public:
-  virtual ~IRtlTransport() = default;
+  virtual ~ITransport() = default;
 
   virtual bool is_usb() const = 0;
 
@@ -67,6 +67,30 @@ public:
   virtual uint32_t read32_wide(uint32_t addr) {
     return read32(static_cast<uint16_t>(addr));
   }
+
+  /* ---- pipelined register writes ----
+   * Inside a write batch, register writes are submitted as asynchronous
+   * in-order transfers and only a read (or a bulk transfer, or flush_writes)
+   * waits for them. The Jaguar3 bring-up is ~14k EP0 round trips; on the
+   * one unit and host measured (an RTL8812EU on an ssc338q) a synchronous
+   * write cost ~80 us and a pipelined one ~27 us at depth >= 8 — one device,
+   * one host, so a scale rather than a number to plan by; the measured
+   * bring-up figures and their limits are in src/jaguar3/CLAUDE.md.
+   * Correctness rests on EP0 completing URBs in submission order, so a read
+   * that follows a write still sees it. Single-threaded by contract: open a
+   * batch only while no other thread touches the transport (the Jaguar3
+   * InitWrite/Init bring-up), and close it before any worker thread starts.
+   * write_batch_end drains and reports whether every queued write completed
+   * (a failed or short completion is only known after the fact); the caller
+   * decides what an incomplete batch means. Defaults are no-ops (PCIe). */
+  virtual void write_batch_begin() {}
+  virtual bool write_batch_end() { return true; }
+  virtual void flush_writes() {}
+  /* Register transfers (reads + writes) this transport instance has issued
+   * so far — the unit a USB bring-up is paid in. InitTimer differences it
+   * per stage. Per instance, never process-wide. 0 where the notion does
+   * not apply (PCIe MMIO). */
+  virtual uint64_t ctrl_xfers() const { return 0; }
 
   /* ---- frame plane ---- */
   /* Fire-and-forget data TX (the send_packet hot path). `ep` is the USB

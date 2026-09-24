@@ -11,7 +11,7 @@ them. Do not reach for a Jaguar file expecting a shared mechanism.
 
 ## HAL layout
 
-`Rtl8733bDevice` (the `IRtlDevice` boundary), `Rtl8733bBringup` (card
+`Rtl8733bDevice` (the `IRadio` boundary), `Rtl8733bBringup` (card
 enable/disable power sequence, system-cfg), `Halmac8733bMac` (MAC init,
 firmware download, EFUSE read + packed-map decode, monitor RX config),
 `Phy8733b` (BB/RF table apply, channel plan, TXAGC, TSSI), plus the header-only
@@ -29,7 +29,7 @@ output.
 Chip-id first: `SYS_CFG2` must read `0x16`. The PID table exists for discovery
 and for one safety property — a device whose PID is a known 8733B identity but
 whose chip-id read fails is **refused**, not allowed to fall through to the
-historical Jaguar1 default. A wrong-HAL bring-up on this part writes an
+Jaguar1 default. A wrong-HAL bring-up on this part writes an
 unrelated register map.
 
 ## Chip facts
@@ -171,7 +171,7 @@ unrelated register map.
 The timing figures above (84 ms, ~11 fps, 2.51/2.71 ms) come from the original
 `f72b` validation unit and have no in-repo oracle. They are register-sequence
 and USB-transfer costs. Treat them as the order of magnitude to design
-against, not as constants. (RF-domain quantities are now measured on the
+against, not as constants. (RF-domain quantities are measured on the
 `b733` sample — see Validation status.)
 - **EFUSE**: physical packed map walked into a logical map. Running off the end
   of the readable span is address-space exhaustion, not corruption — a fully
@@ -240,11 +240,12 @@ untouched) and fall back to the full path.
 
 ## Not ported
 
-`ReadTsf`/beacons, hardware ACK/BlockAck, A-MPDU,
+`ReadTsf`/beacons, A-MPDU, CCX `tx.report` per-frame TX outcomes (the
+TX-report engine — CCX **CLM** busy airtime IS ported, see below),
 `FastSetBandwidth`, the flat-index / per-rate-diff TX-power knobs
 (`SetTxPowerIndexOverride`, `SetTxPowerRateDiffs`, `ReApplyTxPower` — only the
 relative `SetTxPowerOffsetQdb` is ported), `rx.path` per-chain telemetry,
-and CCA disable. These inherit `IRtlDevice`'s not-ported defaults (`false`,
+and CCA disable. These inherit `IRadio`'s not-ported defaults (`false`,
 `0`, or a full-path fallback) rather than being faked. `SetCcaMode` is the one
 exception to the silent-default rule: it is pure virtual, so `true` throws
 loudly — without tearing the session down, since an unported optional knob is
@@ -264,7 +265,7 @@ The TX-power knobs are the other exceptions, in the same spirit:
   register carries. (That path has no hardware coverage — every unit seen so
   far is TSSI-offset PG — but it writes no registers, only a log and a reset.)
 - `SetTxPowerIndexOverride` is overridden **solely to log a refusal**. The
-  `IRtlDevice` default returns `void` and ignores the value, so silence would
+  `IRadio` default returns `void` and ignores the value, so silence would
   be the caller's only answer on the one backend where the flat index really is
   unported — a knob that looks granted, in the PR that exists to abolish them.
   `SetTxPowerRateDiffs` needs no such override: its `false` return already says
@@ -275,6 +276,130 @@ warns rather than dropping it — a config knob must not be the one door where a
 request the setter refuses loudly instead vanishes without a word. The warning
 sits in `bring_up_to_phy`, not `InitWrite`, so an RX-only session that set the
 knob is told too, and so it fires exactly once per bring-up.
+
+## Hardware ARQ
+
+Two of the three hardware-ARQ knobs are measured true on this die; the third is
+refused loudly because the backend lacks the control path needed to complete
+its diagnosis safely.
+
+The detailed ARQ characterization below used the original `f72b` RTL8731BU,
+an RTL8812AU peer, and an RTL8812CU passive witness. The live responder-disarm
+cell was independently repeated on the `b733` sample by the maintainer and on
+a second vehicle-mounted `f72b`; both agreed. No vendor-driver A/B exists, and
+the other ARQ rows remain single-bench results rather than population
+qualification. Witness copy counts are conservative observations because a
+passive monitor can miss airings.
+
+`DeviceConfig::tx::ack_timeout_us` is honoured. The field's contract — range,
+clamp, default, registers and range budget — is doc-commented at its
+declaration in `src/DeviceConfig.h`. What is specific to this backend:
+`init_wmac()` writes vendor defaults first, then `bring_up_to_phy` overwrites
+and verifies both REG_ACKTO 0x0640 (OFDM/HT) and REG_ACKTO_CCK 0x0639. A
+failure or mismatched readback aborts bring-up instead of reporting a partly
+applied range knob. Both registers read back 33 and 200 in direct runs. At 11M
+CCK to a dead RA, retry 8 and maximum duty, an 8-second run submitted 1513
+frames at 33 µs versus 1129 at 200 µs. That establishes the expected timing
+direction; it is not a precise calibration of the register's timebase.
+
+**`SetAckResponder` is ported and measured.** It writes the shared recipe's
+three registers — not an assumed map, since the vendor's own port-0 descriptor
+names them (`hal/rtl8733b/rtl8733b_ops.c` `port_cfg[0]`:
+net_type `REG_CR_8733B + 2` = 0x0102 shift 0, macaddr 0x0610, bssid 0x0618).
+Its behavior is deliberately not described as the generic gate story: MAC
+bring-up leaves net_type at NoLink and programs the EFUSE MAC into MACID, and
+NoLink does not make this die passive. The authoritative behavior and numbers
+live in `src/AckResponder.h` and `src/AdapterCaps.h`.
+
+Three properties of the port worth knowing, none of them local inventions: the
+arm refuses a group MAC and is read back before it is reported, both through
+the shared `ack::is_unicast` / `ack::verify` beside `enable()` — the register
+map lives in one file, so no backend carries a copy that can drift from it. A
+config-driven arm that fails **fails the bring-up** rather than handing back a
+session that quietly answers nothing. And the disarm is unconditional inside
+`Halmac8733bMac::stop()`, not a flag-guarded special case at the device layer:
+`stop()` clears only REG_CR's low half, so net_type at 0x0102 survives it, and
+siting the clear there means no future path can reach `stop()` and leave an
+unowned SIFS-timed transmitter on the air. After an armed session ends with
+`teardown_power_down` off, the peer reads ack_rate 0.00 with retries pinned at
+12 — that silence comes from `stop()`'s RCR and CR writes taking the MAC down,
+not from the net_type clear, which is inert on this die (`src/AckResponder.h`
+retarget(), `Rtl8733bDevice::disarm_ack_responder`).
+
+Responder capability and its measured limits live in `src/AdapterCaps.h`
+(`ack_responder_ok`); the arm/disarm recipe and why this die needs a retarget
+live in `src/AckResponder.h` and `Rtl8733bDevice::ClearAckResponder`. Read
+those rather than a copy here. The harness is
+`tests/ack_txreport_matrix.sh` with the 8733B as RESPONDER; its `disarmed`
+phase is the only cell that measures a DISARM (it arms, then disarms mid-run
+via the RTL8733B-only `DEVOURER_ACK_DISARM_AFTER_MS` hook after completed
+bring-up), because its `off` cell never arms at all.
+
+Soliciting-TX ACK recognition is measured independently.
+`tests/rtl8733b_arq_tx_onair.sh` puts the RTL8733B in the soliciting-TX role,
+the RTL8812AU in the responder role, and uses an RTL8812CU only as a passive
+payload-counter witness. At MCS3, responder on/off produced 1.032/12.948
+copies per observed frame with 99.7/100% coverage. At 11M CCK the result was
+1.002/11.908 with 95.8/92.3% coverage. This proves that the RTL8733B recognizes
+a real ACK and stops autonomous retry in these normal-ACK cells; it does not
+substitute for the unavailable per-frame delivery report.
+
+**BlockAck response is measured without CCX.** Per-frame CCX accounting is not
+a valid retry oracle under A-MPDU (`docs/aggregation.md`), so
+`tests/rtl8733b_blockack_onair.sh` uses a Jaguar2 `0bda:b812` TX, this RTL8733B
+as responder, and a Jaguar1 `0bda:8812` passive witness. At ch36/MCS3 with
+retry limit 12, the fully initialized but unarmed control produced 1,605 unique
+payloads at 12.720 copies/payload and zero matching BlockAck frames; armed
+produced 128,702 at 1.001 plus 14,402 addressed `0x94` BlockAcks, every one
+carrying a nonzero bitmap. Both arms were real A-MPDUs (`paggr` 0.665/1.000,
+max burst 9). The control-frame event checks RA=the Jaguar2 TA and TA=the
+configured RTL8733B MAC, so ambient BlockAcks do not count. This establishes
+the RTL8733B responder on that measured combination only. RTL8733B A-MPDU
+**TX** remains unported and unmeasured.
+
+**`tx.retry_limit` drives real autonomous retransmission** — `tx_retry_limit_ok`
+is true. `tests/rtl8733b_retry_limit_onair.sh` judges from the air because this
+die has no TX-side CCX reports: unicast to an unowned RA ensures no ACK ever
+returns, while a passive monitor counts clean airings per submitted frame. A
+dose-response rather than an on/off pair gives multi-level evidence. The
+harness uses a run-specific unicast SA, counts every clean payload-counter
+event, refuses fewer than three distinct levels or a missing zero baseline,
+and rejects partial runs. Measured 0 -> 1.00, 3 -> 4.00, 12 -> 12.32–12.33
+copies/frame against expected 1 + N, repeatable across a 0/3/12/0/12 ladder.
+The retry-12 shortfall from the ideal 13 may be passive-monitor loss or
+genuinely fewer airings, so the ratio is reported as an observation, not an
+exact hardware count.
+
+**CCX `tx.report` is NOT ported, and its root cause is unresolved.** This is
+the per-frame TX-outcome engine, a different thing from the CCX **CLM**
+busy-airtime measurement documented under "Frame-free sensing" below, which
+is ported and measured. The
+descriptor and receive-side investigation narrows the problem but does not
+prove a firmware defect: SPE_RPT is dword2[19] and SW_DEFINE dword6[11:0] via
+the generic halmac
+NIC macros the 8733B maps straight onto (`hal/halmac/halmac_tx_desc_chip.h`
+maps `SET_TX_DESC_{SPE_RPT,SW_DEFINE}_8733B` onto the non-V2 pair, not the
+0x20/0x24 V2 placement), and a probe build confirmed the bit set in a live
+descriptor; the RX side already decodes C2H at the vendor's own dword2[28]
+(`GET_RX_DESC_C2H_8733B`); the delivery path is bulk-IN, which is what the
+vendor uses (its USB interrupt handler is an empty stub behind an undefined
+config); and the vendor's C2H dispatch confirms this firmware speaks the
+fw-offload format `parse_ccx_halmac` already decodes (`C2H_EXTEND` 0xFF +
+sub_cmd 0x0F, `hal/rtl8733b/rtl8733b_cmd.c`). With an RX loop live and 3160
+frames received, the firmware returned **zero** C2H packets in any format —
+with and without a net_type armed, and with the peer both ACKing and silent.
+The leading missing prerequisite is the halmac H2C queue plus a
+MEDIA_STATUS_RPT registering the descriptor MACID with the firmware; this
+backend has no H2C transport. Until that path is implemented and tested, the
+absence of reports cannot be assigned to firmware. The knob warns at bring-up
+rather than stamping descriptors that are not known to produce anything —
+`tx.report` requested on this die is refused out loud, not silently dropped.
+
+Consequence a consumer should plan around: the measured 8733BU can be **either
+end** of a normal-ACK hardware-ARQ link, but it cannot see per-frame delivery.
+`TxReport.state == 1`
+— the retry write-off that says a peer stopped ACKing — is unavailable here, so
+detecting a departed peer needs an application-level timeout.
 
 ## Validation status
 
@@ -300,3 +425,81 @@ Headless coverage: `tests/rtl8733b_{efuse,phy_table,rx_parse,tx_desc}_selftest.c
 in `ctest`. Hardware: `tests/rtl8733b_lifecycle_soak.sh` (bounded warm
 lifecycle, explicitly not a true VBUS cycle) and `examples/rtl8733bprobe`
 (staged identity → power/EFUSE → firmware → MAC/PHY → TSSI audit).
+
+## Frame-free sensing: CLM busy airtime, and nothing else
+
+`IRadio::ArmChannelBusy()` / `GetChannelBusy()` work on this die. The vendor
+phydm puts the 8733B on JGR3 — at the pinned `reference/rtl8733bu-20230626`,
+`hal/phydm/phydm_pre_define.h:513` lists `ODM_RTL8733B` in
+`PHYDM_IC_SUPPORT_IFS_CLM`, and `:523-525` define
+`PHYDM_IC_JGR3_SERIES_SUPPORT` when `RTL8733B_SUPPORT` is set. The engine
+answers on that register map through
+the shared `devourer::ClmWindow` — `with_ccx()` in `Rtl8733bDevice.h` lends it
+`nhm_regs_jgr3()` under `_reg_mu` then the CCX mutex, exactly as Jaguar2/3 do.
+
+The flag relationship and the armed-only behaviour are the contract, and it
+lives at `src/AdapterCaps.h` on `busy_airtime_ok` / `rx_energy_ok` — the one
+place it can be kept true. What is specific to this die:
+
+- **Why CLM ports without a phydm block at all.** `arm_clm_only()` /
+  `read_clm_only()` take no IGI argument: busy airtime is a hardware tick
+  count, not a histogram referenced to the receiver's own noise floor the way
+  NHM's thresholds are. That is what makes it separable from FA/CCA here.
+- There is no NHM read on this die, so the `Interrupted` spoiler is
+  unreachable by construction: nothing can re-arm the shared engine
+  mid-window. `Retuned` and `NotElapsed` both fire normally.
+
+Measured with `tests/busy_window_probe.sh` (RTL8733BU sensor, MT7612U flooder,
+ch165): **0.0% quiet, 69% under a steady load** with spread 0, and against a
+50/450 ms burst (true duty ~9%) a mean of 6-10% over five windows with a
+**19-point spread** — a 240 ms window inside a 500 ms burst period misses
+whole bursts, so single windows read 0-19% and only the mean is a measurement. A Jaguar3 8812CU read
+that same flooder at 69% as well, so the two device paths onto the JGR3 map
+agree on one load. The retune and premature-read spoilers each refused with
+their reason, and a re-armed window never returned the previous latched value.
+
+**`src/sensing/` cannot reach this reading.** `SenseWindow` picks its source
+by whether the `IRtlRadio*` is non-null rather than by `rx_energy_ok`, so on
+this die it takes the phydm branch and never arms or reads CLM —
+`examples/chanscout` on an RTL8733B reports neither. That is a sensing-layer
+bug this die is merely the first to expose; it is described, with what a fix
+needs, in `src/sensing/CLAUDE.md`. Until it lands, a caller on this die
+reaches `IRadio::ArmChannelBusy`/`GetChannelBusy` directly.
+
+**The CCA gate cannot bias the reading here.** CLM counts CCA-busy, so a
+session with CCA disabled would under-report — but `SetCcaMode` throws "CCA
+disable is not implemented by this backend" on this die, so that state is
+unreachable rather than merely unlikely.
+
+**`Stop()` forgets the window, and that is not obvious.** A stop is not a
+retune, so nothing would spoil an armed window — but clearing `_phy_ready`
+does not protect it either, because `SetMonitorChannel` and `FastRetune` both
+call `bring_up_to_phy()`, which sets that flag true again. Without a reset in
+`Stop()`, a window armed before a stop comes back to life on the revived chip
+and the retune note hands the caller a `Retuned` spoil earned by a hardware
+session that no longer exists: invalid either way, but the reason would be a
+lie. The reset is scoped under the `_reg_mu` `Stop()` already holds.
+
+All of that is about a window armed BEFORE the Stop. For an arm issued
+*after* one, the flag does its job, and this backend closes both sides of the
+hazard: SEQUENTIALLY, `Stop()` clears `_phy_ready`, which is what `with_ccx`
+gates on, so a later `ArmChannelBusy()` is refused rather than arming a
+torn-down chip; CONCURRENTLY, `Stop()` holds the recursive `_reg_mu` across
+its whole body and `with_ccx` takes that lock first, so an arm racing the
+teardown blocks instead of slipping in after the reset.
+
+Jaguar1/2/3 reset the window in `Stop()` the same way but stop there — they
+have NEITHER half: no `Stop()` clears `_brought_up`, and none holds a
+register lock across its teardown (Jaguar1 has no family-wide one at all).
+So on those an arm issued after a Stop still succeeds against a torn-down
+chip, and one racing the teardown can still slip in. Each Jaguar guide
+records its own generation's teardown, the race is in each `Stop()`'s own
+comment, and `IRadio::ArmChannelBusy` carries the rule itself.
+
+Retune notes live in `SetMonitorChannel` and `FastRetune`, both **scoped**:
+`FastRetune` calls `SetMonitorChannel` on its declined path while already
+holding `_reg_mu` (recursive, so that part is fine), and the CCX mutex is NOT
+recursive — holding it across the tune would self-deadlock on that path. One
+note per site suffices because `_reg_mu` is held across the whole tune and
+`with_ccx` takes `_reg_mu` first, so a concurrent arm cannot interleave; that
+is the Jaguar2/3 situation, not Jaguar1's.

@@ -6,7 +6,7 @@
  * via shared_ptr, so the transport — and with it the USB device lock or the
  * vfio fds + DMA rings — lives until the last copy dies).
  *
- * The bus specifics live behind IRtlTransport (src/RtlTransport.h): USB =
+ * The bus specifics live behind ITransport (src/Transport.h): USB =
  * devourer::UsbTransport (libusb vendor-control registers + bulk endpoints),
  * PCIe = devourer::PcieTransport (BAR2 MMIO registers + 88xx DMA rings). The
  * adapter itself carries only bus-neutral chip helpers built on the register
@@ -32,7 +32,7 @@
 #endif
 
 #include "DeviceConfig.h"
-#include "RtlTransport.h"
+#include "Transport.h"
 #include "TxStats.h"
 #include "drv_types.h"
 #include "hal_com_reg.h"
@@ -60,7 +60,7 @@ enum TxSele {
 };
 
 class RtlAdapter {
-  std::shared_ptr<devourer::IRtlTransport> _transport;
+  std::shared_ptr<devourer::ITransport> _transport;
   Logger_t _logger;
 
   /* USB-descriptor-derived facts (defaults on PCIe), mirrored at construction
@@ -81,13 +81,18 @@ public:
              std::shared_ptr<devourer::UsbDeviceLock> usb_lock = nullptr,
              const devourer::DeviceConfig &cfg = {});
   /* Any transport (the PCIe factory path; also the seam for future buses). */
-  RtlAdapter(std::shared_ptr<devourer::IRtlTransport> transport,
+  RtlAdapter(std::shared_ptr<devourer::ITransport> transport,
              Logger_t logger, const devourer::DeviceConfig &cfg = {});
 
   bool is_usb() const { return _transport->is_usb(); }
   /* Pre-power-on HCI programming (rtw88 rtw_hci_setup slot): PCIe TRX ring
    * registers; no-op on USB. Call per bring-up attempt, before power-on. */
   void hci_setup() { _transport->hci_setup(); }
+  /* Pipelined register writes — see ITransport::write_batch_begin. */
+  void write_batch_begin() { _transport->write_batch_begin(); }
+  bool write_batch_end() { return _transport->write_batch_end(); }
+  void flush_writes() { _transport->flush_writes(); }
+  uint64_t ctrl_xfers() const { return _transport->ctrl_xfers(); }
 
   /* Kernel-style async RX: keep n_urbs concurrent bulk-IN transfers in flight
    * (USB) or reap the RX buffer-descriptor ring (PCIe), invoking
@@ -141,7 +146,7 @@ public:
   }
   void bulk_clear_halt(uint8_t ep) { _transport->clear_halt(ep); }
 
-  /* Stop TX and wait out everything already submitted (IRtlTransport::
+  /* Stop TX and wait out everything already submitted (ITransport::
    * quiesce_tx). Must run while the caller's bus context is still alive —
    * the device Stop()/destructor does it, so callers rarely need this. */
   void quiesce_tx() { _transport->quiesce_tx(); }
@@ -158,7 +163,7 @@ public:
   uint8_t efuse_OneByteRead(uint16_t addr, uint8_t *data);
   void phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask, uint32_t data);
 
-  /* 32-bit-address register write (see IRtlTransport::write32_wide) — the
+  /* 32-bit-address register write (see ITransport::write32_wide) — the
    * halbb/halrf BB window lives at addr + 0x10000 (wIndex=1 over USB), out of
    * reach of the 16-bit rtw_write path. */
   bool rtw_write32_wide(uint32_t addr, uint32_t value) {

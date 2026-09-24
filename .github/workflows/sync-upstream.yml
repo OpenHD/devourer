@@ -1,0 +1,51 @@
+name: Sync from OpenIPC upstream
+
+on:
+  schedule:
+    # Daily at 03:17 UTC. The non-round minute avoids peak Actions load.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: devourer-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync master and OpenHD branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          submodules: false
+
+      - name: Merge upstream changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/OpenIPC/devourer.git
+          git fetch --no-tags upstream master
+
+          # Keep the workflow owned by the OpenHD fork while integrating every
+          # upstream commit. A merge conflict deliberately fails the job so an
+          # OpenHD-specific change is never overwritten automatically.
+          git merge --no-edit upstream/master
+          git push origin HEAD:master
+
+          # OpenHD builds use this branch. Keep its five local commits and merge
+          # the freshly synchronized master on top of them.
+          git fetch --no-tags origin openhd-fhss-session
+          git switch --create openhd-fhss-session --track origin/openhd-fhss-session
+          git merge --no-edit master
+          git push origin HEAD:openhd-fhss-session

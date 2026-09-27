@@ -100,7 +100,7 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | `rx.scrambler` | RX (`DEVOURER_DUMP_SCRAMBLER`) | seed "0xNN", rate, hits, len |
 | `rx.energy` | RX (`DEVOURER_RX_ENERGY_MS` / sweep) | t, [ch], cca_ofdm\|null, cca_cck\|null, fa_ofdm\|null, fa_cck\|null, igi\|null, abs_noise_floor_dbm\|null, clm\|null (CCX busy airtime %), nhm_env\|null (NHM mass above the receiver's own floor, %), [retune_us], frames, frames_ldpc, frames_stbc, crc_err, icv_err, rssi_mean, rssi_max, snr_mean, snr_min, evm_mean — crc/icv nonzero only under `DEVOURER_RX_KEEP_CORRUPTED` (the parser drops failed frames otherwise) |
 | `rx.nhm` | RX | [ch], peak, busy (naive mass above bucket 0 — rails ~100 on a quiet channel), ratio, env (same mass with the IC's own noise-floor cluster removed — the comparable one), dur, hist[12] |
-| `rx.quality` | RX (`DEVOURER_RXQUALITY`) | verdict, frames, rssi_mean_dbm, rssi_max_dbm, snr_mean_db, snr_min_db, evm_db\|null, noise_floor_dbm\|null, abs_noise_floor_dbm\|null, igi |
+| `rx.quality` | RX (`DEVOURER_RXQUALITY`) | verdict, frames, rssi_mean_dbm, rssi_max_dbm, snr_mean_db\|null, snr_min_db\|null, evm_db\|null, noise_floor_dbm\|null, abs_noise_floor_dbm\|null, igi |
 | `adapter.rxpaths` | RX (`DEVOURER_RXQUALITY`) | active_mask "0xNN", n_active, n_chains, frames, rssi_dbm[], snr_db[], evm_db[] — GetActiveRxPaths live per-chain activity (the caps rx_chains companion); snr_db/evm_db only when a chain carried the metric this window (EVM -128 no-stream rail excluded) |
 | `link.health` | RX (`DEVOURER_LINKHEALTH`) | verdict, rssi_dbm, snr_db, evm_db\|null, frames, fa_ofdm\|null, igi\|null, [igi_floor], [igi_ceil], cause, fix |
 | `fw.c2h` | RX, duplex (`DEVOURER_TX_STATUS`) | len, bytes hex |
@@ -109,7 +109,7 @@ Emitters: L = library, RX/TX/... = demo. Optional fields in [brackets];
 | ev | emitter | fields |
 |---|---|---|
 | `tx.frame` | TX | n, rc — precoder demo variant: n, ok |
-| `tx.stats` | TX | submitted, failed, was_timeout, last_rc |
+| `tx.stats` | TX | submitted, failed, was_timeout, last_rc; periodic events (not the `final:1` one) also carry `txdma_status` (the MAC TX-DMA fault latch; nonzero = the transmitter has stopped) where `IRtlRadio::HasTxDmaStatus()` (which backends: its declaration), or `txdma_read_failed:1` when that sample's register read failed |
 | `tx.agg` | L (`DEVOURER_TX_USB_AGG`, send_packets) | frames, bytes, shim, ok — one per multi-frame bulk-OUT URB. The sync-TX generations (Jaguar2/Jaguar3/RTL8733B) also emit `sent` — bytes actually transferred, OR the negative libusb rc on a transport error (deliberately raw: this event is the only machine-readable carrier of the aggregated-path error code) — and set `ok` only on a FULL write, so `ok=false` splits as `sent < 0` transport error vs `0 <= sent < bytes` short write. Jaguar1 TX is async: its `ok` means URB accepted by the transport and there is no `sent` field (bytes resolve at completion reaping) |
 | `tx.report` | L (`DEVOURER_TX_REPORT`, CCX decode) | t, state (0=delivered, 1=retry-drop), ok, retries, final_rate, queue_time_raw, bmc, macid, fmt ("8812"\|"halmac"); halmac adds tag (SW_DEFINE echo), rts_retries, missed (fw-stuffed constant on Jaguar3 — tag gaps are the drop signal; `tests/txrpt_coverage_attrib.py`) — t is the achieved-report-rate timebase (the CCX emission ceiling is reports/s) |
 | `tx.status` | RX, duplex (C2H TX_RPT decode) | hoff, queue, retry, airtime_us, rate |

@@ -1012,6 +1012,16 @@ target_include_directories(NoiseFloorMathSelftest PRIVATE
 
 add_test(NAME noise_floor_math COMMAND NoiseFloorMathSelftest)
 
+# Headless guard for src/BulkOutTimeout.h: under
+# DeviceConfig::Tx::no_cancel_multipkt a multi-packet bulk-OUT data send gets
+# no timeout (a cancel mid-transfer lets another sender's queued bytes splice
+# into the packet and wedges the Realtek TXDMA). Pure, header-only.
+add_executable(BulkOutTimeoutSelftest tests/bulk_out_timeout_selftest.cpp)
+target_include_directories(BulkOutTimeoutSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_test(NAME bulk_out_timeout COMMAND BulkOutTimeoutSelftest)
+
 # Headless guard for the NHM utility reduction (src/NhmEnvMath.h): bucket
 # weights, the rounded ratio helper shared with CLM, and the noise-floor-cluster
 # exclusion that makes nhm_env_ratio usable where the naive ratio rails. Pure
@@ -1388,6 +1398,17 @@ add_executable(TxAggSelftest
 target_link_libraries(TxAggSelftest PRIVATE devourer)
 target_include_directories(TxAggSelftest PRIVATE src)
 add_test(NAME txagg_pack COMMAND TxAggSelftest)
+
+# Headless guard for the ReadPacketBuffer window bound (src/PktBufWindow.h,
+# generation-neutral) and the Jaguar3 QSEL -> bulk-OUT map (incl. the
+# <3-endpoint fallback to endpoint 0, src/jaguar3/TxQueueMap.h). Built on
+# every configuration like TxAggSelftest: it links `devourer` only for the
+# DEVOURER_HAVE_* defines, and its Jaguar3 cases self-gate on
+# DEVOURER_HAVE_JAGUAR3.
+add_executable(TxQueueSelftest tests/txqueue_selftest.cpp)
+target_link_libraries(TxQueueSelftest PRIVATE devourer)
+target_include_directories(TxQueueSelftest PRIVATE src)
+add_test(NAME txqueue_map COMMAND TxQueueSelftest)
 
 # Headless guard for the beamforming-report decoder (src/BfReportDecode.h) — the
 # LSB-first Givens-angle unpacking + per-tone variance behind sense. It

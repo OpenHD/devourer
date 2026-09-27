@@ -269,6 +269,10 @@ those are the ones listed below.
   unbounded). Exits through the ordinary `Stop()` path once N frames have been
   submitted, so first-light and regression captures get a clean teardown
   instead of a killed timed flood.
+- `DEVOURER_TX_BEACON_TU=N` — txdemo arms a hardware TBTT beacon at N TU
+  before injecting, on Jaguar2/3 only (unset/`0` = off); contract at its
+  comment in
+  `examples/tx/main.cpp`, reproducer use in `docs/jaguar3-tx-ring.md`.
 - `DEVOURER_USB_DEBUG=1` — libusb DEBUG log level (~7 MB / 15 s, has filled
   `/tmp` mid-capture; adds 0.5–0.8 s to init).
 - `DEVOURER_THERMAL_POLL_MS=N` — emit `thermal` events from the RF 0x42 meter,
@@ -696,7 +700,11 @@ USB3 round-trip saturates on one blocking thread, and sync gives the HalMAC
 bring-up a clean per-send NAK backoff); the RTL8733B is synchronous too, so
 every submission has a bounded result and no buffer outlives the `send_packet`
 call. Don't unify the modes — either direction regresses throughput or
-bring-up safety.
+bring-up safety. The one opt-in exception is
+`DeviceConfig::Tx::no_cancel_multipkt`: Jaguar2/3 and Kestrel DATA sends
+longer than one USB packet then wait without a timeout (a cancelled
+multi-packet transfer can wedge the TXDMA); firmware download and every
+default stay bounded — the trade-off is at the declaration.
 
 **Nothing reads a register per frame on the send path.** Measured on one
 RTL8733B unit during bring-up: a single thermal read (3 RF writes + a 15 µs

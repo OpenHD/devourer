@@ -213,10 +213,10 @@ bool HalmacJaguar3Fw::send_fw_page(uint16_t pg_addr, const uint8_t *chunk,
   std::memcpy(d + TXDESC_SIZE_8822C, chunk, size);
   cal_txdesc_chksum_8822c(d);
 
-  bool sent = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
-                                        frame.data(),
-                                        static_cast<int>(frame.size()),
-                                        1000) >= 0;
+  const int transferred = _device.bulk_send_sync_ep(
+      _device.first_bulk_out_ep(), frame.data(),
+      static_cast<int>(frame.size()), 1000);
+  const bool sent = transferred == static_cast<int>(frame.size());
   bool status = sent;
 
   if (sent) {
@@ -231,7 +231,8 @@ bool HalmacJaguar3Fw::send_fw_page(uint16_t pg_addr, const uint8_t *chunk,
       delay_us(10);
     }
   } else {
-    _logger->error("Jaguar3 DLFW: rsvd-page bulk-OUT failed");
+    _logger->error("Jaguar3 DLFW: rsvd-page bulk-OUT failed/short ({}/{})",
+                   transferred, frame.size());
   }
 
   /* Restore (rsvd_boundary head + the two saved bytes). */

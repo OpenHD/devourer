@@ -1,4 +1,5 @@
 #include "RtlJaguar2Device.h"
+#include "PktBufWindow.h"
 
 #include <algorithm>
 #include <climits>
@@ -27,6 +28,7 @@
 #include "NhmReader.h"
 #include "ToneMask.h"
 #include "RateDefinitions.h"
+#include "RtlTsf.h" /* REG_TSFTR read/write shared with Jaguar1/3 */
 #include "RxPacket.h"
 #include "SignalStop.h" /* g_devourer_should_stop */
 extern "C" {
@@ -297,7 +299,13 @@ void RtlJaguar2Device::start_pwrtrack() {
         continue;
       int cck = -1, ofdm = -1, mcs7 = -1;
       _hal.txagc_shadow(cck, ofdm, mcs7);
-      _cal->pwr_track(ofdm);
+      /* Same hazard as the DIG thread: a register read that throws under RX
+       * load must skip this tick, not terminate the process. */
+      try {
+        _cal->pwr_track(ofdm);
+      } catch (const std::exception &e) {
+        _logger->warn("Jaguar2 thermal track: tick skipped ({})", e.what());
+      }
     }
   });
   _logger->info("RtlJaguar2Device: thermal-track thread started");
@@ -365,10 +373,30 @@ void RtlJaguar2Device::apply_replay_wseq() {
 }
 
 bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
+  if (!devourer::ack::is_unicast(mac.data())) {
+    /* A station cannot ACK-target a group address, so this arm could never
+     * fire. Refusing beats returning true for a responder that will read as
+     * silently dead — the shape AdapterCaps.h records from the 8821AU
+     * episode. Only the precondition is enforced here: adopting the shared
+     * readback verify() too wants a bench cell per die, since a family whose
+     * 0x0102 does not read back would start refusing healthy arms. */
+    _logger->error("{}: ACK responder needs a UNICAST MAC (I/G set in "
+                   "{:02x}) — not armed",
+                   "Jaguar2", mac.bytes[0]);
+    return false;
+  }
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */
-  devourer::ack::enable(_device, mac.data());
+  if (!devourer::ack::enable(_device, mac.data())) {
+    if (!devourer::ack::disable_verified(_device)) {
+      _logger->error("Jaguar2: ACK responder arm failed and rollback did "
+                     "not latch; hardware state is unknown");
+    } else {
+      _logger->error("Jaguar2: ACK responder arm register write failed");
+    }
+    return false;
+  }
   _logger->info("Jaguar2: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
@@ -377,7 +405,10 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
 }
 
 void RtlJaguar2Device::ClearAckResponder() {
-  devourer::ack::disable(_device);
+  if (!devourer::ack::disable_verified(_device)) {
+    _logger->error("Jaguar2: ACK responder disarm did not latch");
+    return;
+  }
   _logger->info("Jaguar2: hardware ACK responder disarmed (net_type=NoLink)");
 }
 
@@ -421,8 +452,17 @@ void RtlJaguar2Device::ClearAmpduMode() { SetAmpduMode(devourer::AmpduMode{}); }
 
 void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _channel = channel;
   bring_up(channel);
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
 
   /* DEVOURER_BF_ARM_BFEE=aa:bb:cc:dd:ee:ff — beamforming self-sounding
    * (beamformee side), Jaguar-2 variant. Arms the hardware CSI responder to
@@ -458,8 +498,10 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     }
   }
 
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar2: configured ACK responder could not be armed");
   apply_replay_wseq();
 
   if (_cfg.debug.bb_dump) {
@@ -490,9 +532,21 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   _dig_stop = false;
   if (!_cfg.tuning.skip_dig) {
     _dig_thread = std::thread([this] {
+      uint64_t skipped = 0;
       while (!_dig_stop && !g_devourer_should_stop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        _hal.dig_step();
+        /* A control-transfer read can race the async bulk-IN and throw under
+         * RX load (the same hazard the CFO tracker guards below). Uncaught on
+         * this thread it is std::terminate - it killed an 8812BU AP mid-way
+         * through a 14-20 Mbit/s uplink. DIG is a tracking loop: a failed
+         * tick is skipped, counted, and the next one re-reads everything. */
+        try {
+          _hal.dig_step();
+        } catch (const std::exception &e) {
+          if (skipped++ % 100 == 0)
+            _logger->warn("Jaguar2 DIG: tick skipped after a failed register "
+                          "access ({}), {} so far", e.what(), skipped);
+        }
       }
     });
     _logger->info("RtlJaguar2Device: DIG thread started");
@@ -593,17 +647,32 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         /* Per-frame RSSI/SNR/EVM from the jgr2 PHY-status (present when
          * APP_PHYSTS is on, i.e. drvinfo carries the 32-byte report). CCK rates
          * (DESC_RATE1M..11M = 0..3) use type0, everything else type1. C2H has no
-         * phy-status (drvinfo=0), so the size guard already skips it. */
-        if (!is_c2h && f.drvinfo_size >= 28)
-          jaguar2::parse_phy_sts_jgr2(data + off + jaguar2::RXDESC_SIZE_8822B,
-                                      f.drvinfo_size, f.rx_rate <= 3, p.RxAtrib);
+         * phy-status (drvinfo=0), so the size guard already skips it.
+         * REG_RX_DRVINFO_SZ (0x060F) is a GLOBAL register, so the 32 drvinfo
+         * bytes are reserved on EVERY frame while the PHY writes a report only
+         * where the descriptor's PHYST bit (DW0 bit 26, f.physt) is set —
+         * on an A-MPDU's other subframes the area holds bytes left by an
+         * earlier frame, and parsing them anyway decodes garbage as
+         * rssi/snr/evm/cfo_tail. cfo_tail is the one that does damage: it
+         * steers the closed-loop XtalCap crystal trim below. */
+        PhyStsFill phy = PhyStsFill::None;
+        if (!is_c2h && f.physt && f.drvinfo_size >= 28)
+          phy = jaguar2::parse_phy_sts_jgr2(
+              data + off + jaguar2::RXDESC_SIZE_8822B, f.drvinfo_size,
+              f.rx_rate <= 3, _rx_bw_code.load(std::memory_order_relaxed),
+              p.RxAtrib);
+        /* The RAW descriptor bit, matching the field's meaning on Jaguar1 /
+         * Jaguar3 / RTL8733B; `phy` says which fields are safe to fold. */
+        p.RxAtrib.physt = f.physt;
         p.Data =
             std::span<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
-        if (!p.RxAtrib.crc_err) {
+        if (!p.RxAtrib.crc_err && phy != PhyStsFill::None) {
           _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
           _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,
                        _variant == jaguar2::ChipVariant::C8821C ? 1 : 2);
-          if (_cfg.tuning.cfo_track)
+          /* cfo_tail lives only in the type1 layout; the 0 a CCK report leaves
+           * would pull the tracker's average below its enable threshold. */
+          if (_cfg.tuning.cfo_track && phy == PhyStsFill::Full)
             _cfo.add(p.RxAtrib.cfo_tail); /* closed-loop CFO input (#217) */
         }
         _packetProcessor(p);
@@ -636,12 +705,21 @@ void RtlJaguar2Device::stop_dig() {
 }
 
 void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _channel = channel;
   /* TX shares the full cold bring-up (config_trx_mode enables the TX antenna
    * paths, enable_rx sets CR MACTXEN). The chip transmits at its
    * efuse/table-calibrated TXAGC; DEVOURER_TX_PWR=0xNN forces a flat reference
    * (SDR-visibility debug knob). */
   bring_up(channel);
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   /* DEVOURER_TX_PWR=0xNN forces a flat per-rate TXAGC reference (SDR-visibility
    * debug knob) over the efuse-calibrated level bring_up applied — routed
    * through the runtime flat-override knob so it composes with the offset and
@@ -677,8 +755,10 @@ void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
    * center frequency. DEVOURER_CW_TONE_GAIN=0..31 sets RF 0x00[4:0]. */
   if (_cfg.tx.cw_tone)
     StartCwTone(_cfg.tx.cw_tone_gain & 0x1F);
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar2: configured ACK responder could not be armed");
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
   apply_replay_wseq();
@@ -847,8 +927,16 @@ void RtlJaguar2Device::StopContinuousTx() {
 }
 
 void RtlJaguar2Device::SetMonitorChannel(SelectedChannel channel) {
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
   /* Serialize against the thermal-track tick's RF-window read. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The note must not be able to land before a concurrent arm that then
+   * commits while this tune runs. _reg_mu above is what spans the tune, and
+   * with_ccx takes _reg_mu BEFORE this lock, so an arm cannot interleave.
+   * Ordering is always the family's register lock first, then this one. */
+  std::lock_guard<std::mutex> ccx(busy_window_mutex());
+  busy_window_note_retune();
   _channel = channel;
   /* Retune the RF/BB to the new channel. set_channel_bw is a pure tune (RF18 +
    * bandwidth registers) — no per-channel LCK/IQK/TX-power — so it is cheap
@@ -858,6 +946,16 @@ void RtlJaguar2Device::SetMonitorChannel(SelectedChannel channel) {
   _hal.set_channel_bw(static_cast<uint8_t>(channel.Channel),
                       static_cast<uint8_t>(channel.ChannelWidth), _rfe,
                       channel.ChannelOffset);
+  /* Stored after the retune. rxsc 0 is resolved against the width configured
+   * when the frame is PARSED, as the vendor does (phydm_rxsc_2_bw reads the
+   * current dm->band_width): a frame delivered while the retune runs uses the
+   * old width, but one received before the change and delivered after this
+   * store uses the new one. Nothing per-frame could do better — the RX
+   * descriptor and PHY status carry no receive-time bandwidth the vendor
+   * uses (Jaguar2's type1 rf_mode bits only reach a debug print; Jaguar3's
+   * layout comments them out). */
+  _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
+                    std::memory_order_relaxed);
   /* Runtime TX-power knobs in use: re-fold them against the NEW channel's
    * efuse group so the offset stays relative to the calibrated table (TXAGC
    * registers are not per-channel — a cross-group move would otherwise keep
@@ -872,9 +970,15 @@ void RtlJaguar2Device::SetMonitorChannel(SelectedChannel channel) {
 
 void RtlJaguar2Device::FastRetune(uint8_t channel, bool cache_rf) {
   if (channel == _channel.Channel)
-    return;
+    return; /* no tune, so nothing to spoil */
   /* Serialize against the thermal-track tick's RF-window read. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The note must not be able to land before a concurrent arm that then
+   * commits while this tune runs. _reg_mu above is what spans the tune, and
+   * with_ccx takes _reg_mu BEFORE this lock, so an arm cannot interleave.
+   * Ordering is always the family's register lock first, then this one. */
+  std::lock_guard<std::mutex> ccx(busy_window_mutex());
+  busy_window_note_retune();
   const bool band_change = (_channel.Channel <= 14) != (channel <= 14);
   if (_hal.fast_retune(channel, static_cast<uint8_t>(_channel.ChannelWidth),
                        _channel.ChannelOffset, cache_rf)) {
@@ -898,8 +1002,18 @@ void RtlJaguar2Device::FastRetune(uint8_t channel, bool cache_rf) {
 void RtlJaguar2Device::FastSetBandwidth(ChannelWidth_t bw) {
   {
     std::lock_guard<std::mutex> lk(_reg_mu);
+    /* A bandwidth change re-clocks the front end, so a window armed before it
+     * was measuring a different receiver — the same argument as a retune. The
+     * note sits inside _reg_mu, which spans the change, and with_ccx takes
+     * _reg_mu first, so an arm cannot interleave. The fall-through to
+     * SetMonitorChannel is deliberately OUTSIDE this scope: it takes both
+     * locks itself. */
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
     if (_hal.fast_set_bandwidth(static_cast<uint8_t>(bw))) {
       _channel.ChannelWidth = bw;
+      _rx_bw_code.store(channel_width_to_bw_code(bw),
+                        std::memory_order_relaxed);
       return;
     }
   }
@@ -934,7 +1048,12 @@ RxEnergy RtlJaguar2Device::GetRxEnergy(bool with_nhm) {
   RxEnergy e = _hal.last_energy();
   /* The scalars above are a cached snapshot (no IO); the NHM below is the
    * expensive part, so it is the caller's choice. */
-  if (with_nhm)
+  /* Under the CCX lock together with the note — see the Jaguar1 comment: the
+   * read re-arms the shared engine, so an armed busy window is spoiled by it
+   * and the pair must be atomic against a concurrent arm. */
+  if (with_nhm) {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_nhm_read();
     devourer::read_nhm(
       devourer::nhm_regs_11ac(), e.igi,
       [this](uint16_t a) { return _device.rtw_read<uint32_t>(a); },
@@ -942,6 +1061,7 @@ RxEnergy RtlJaguar2Device::GetRxEnergy(bool with_nhm) {
         _device.phy_set_bb_reg(a, m, v);
       },
       e);
+  }
 
   /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor. The
    * vendor phydm_idle_noise_measure_ac: the BB maintains an idle-time power
@@ -1132,6 +1252,10 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
   c.tx_chains = chains;
   c.rx_chains = chains;
   c.per_chain_rssi = chains >= 2;
+  /* CCX CLM via NhmReader's 11AC map; separated arm-vs-quiet on air (#431). */
+  c.busy_airtime_ok = true;
+  c.busy_airtime_measured = true;
+  c.rx_energy_ok = true;
   c.bw_mask = devourer::bw_mask_for_generation(c.generation);
   /* 5/10 MHz baseband re-clock via the 0x8ac small-BW/clock word — both
    * variants, hardware-validated at both widths, both directions and both
@@ -1146,6 +1270,7 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
   c.tx_retry_limit_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.hw_rx_timestamp = true;  /* FrameParserJaguar2 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
+  c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822B readback) */
   c.xtal_cap_max = 0x3f; /* 6-bit AFE crystal-cap trim (0x24/0x28) */
   c.xtal_cap_default = _hal.efuse_logical_byte(0xB9) == 0xFF
                            ? 0x20
@@ -1250,7 +1375,7 @@ bool RtlJaguar2Device::send_packet(const uint8_t *packet, size_t length) {
                                  0);
   if (build_tx_block(packet, length, usb_frame.data(), 0) == 0)
     return false;
-  int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
+  int rc = _device.bulk_send_data_sync_ep(_device.first_bulk_out_ep(),
                                      usb_frame.data(), usb_frame.size(),
                                      /*timeout_ms=*/20);
   /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` would also cover
@@ -1269,7 +1394,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
    * interface-default per-frame loop. */
   const unsigned agg = _cfg.tx.usb_agg_max;
   if (agg <= 1 || !_device.is_usb() || count == 0)
-    return IRtlDevice::send_packets(pkts, count);
+    return IRadio::send_packets(pkts, count);
 
   devourer::TxAggLimits lim;
   lim.desc_size = jaguar2::TXDESC_SIZE_8822B;
@@ -1346,7 +1471,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
     SET_TX_DESC_DMA_TXAGG_NUM_8822B(first, plan.frames());
     jaguar2::cal_txdesc_chksum_8822b(first);
 
-    const int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
+    const int rc = _device.bulk_send_data_sync_ep(_device.first_bulk_out_ep(),
                                              urb.data(), urb.size(),
                                              /*timeout_ms=*/50);
     /* Full write or nothing submitted: a truncated URB means the chip got a
@@ -1671,14 +1796,37 @@ bool RtlJaguar2Device::StartBeacon(const uint8_t *beacon, size_t len,
     _device.rtw_write16(0x061c, (uint16_t)(bs[4] | (bs[5] << 8)));
   }
   /* net_type = AP (REG_CR+2 0x0102 [1:0]); interval; BCN_CTRL = EN_BCN_FUNCTION |
-   * DIS_TSF_UDT (0x18); EN_BCNQ_DL (BIT22 REG_FWHW_TXQ_CTRL). */
-  uint8_t nt = _device.rtw_read8(0x0102);
-  _device.rtw_write8(0x0102, static_cast<uint8_t>((nt & ~0x03u) | 0x03u));
-  _device.rtw_write16(0x0554 /* REG_BCN_INTERVAL */,
-                      static_cast<uint16_t>(interval_tu));
-  _device.rtw_write8(0x0550 /* REG_BCN_CTRL */, (1u << 3) | (1u << 4));
-  uint32_t txq = _device.rtw_read<uint32_t>(0x0420 /* REG_FWHW_TXQ_CTRL */);
-  _device.rtw_write<uint32_t>(0x0420, txq | (1u << 22) /* BIT_EN_BCNQ_DL */);
+   * DIS_TSF_UDT (0x18); EN_BCNQ_DL (BIT22 REG_FWHW_TXQ_CTRL).
+   *
+   * ROLLBACK: from the first enabling write on, a failure must not leave a
+   * half-armed beacon behind - the chip beacons autonomously, and Jaguar2 has
+   * no teardown power-down to silence it. The touch is recorded BEFORE that
+   * write; a refused write (false) rolls back and returns false, a throw
+   * rolls back and rethrows (rollback_beacon_arm_locked), and StopBeacon also
+   * disarms a touched-but-never-armed beacon. The && chain stops at the first
+   * refusal; on success it writes the same registers in the same order. */
+  _bcn_hw_touched = true;
+  bool armed = false;
+  try {
+    uint8_t nt = _device.rtw_read8(0x0102);
+    armed =
+        _device.rtw_write8(0x0102, static_cast<uint8_t>((nt & ~0x03u) | 0x03u)) &&
+        _device.rtw_write16(0x0554 /* REG_BCN_INTERVAL */,
+                            static_cast<uint16_t>(interval_tu)) &&
+        _device.rtw_write8(0x0550 /* REG_BCN_CTRL */, (1u << 3) | (1u << 4));
+    if (armed) {
+      uint32_t txq = _device.rtw_read<uint32_t>(0x0420 /* REG_FWHW_TXQ_CTRL */);
+      armed = _device.rtw_write<uint32_t>(0x0420,
+                                          txq | (1u << 22) /* BIT_EN_BCNQ_DL */);
+    }
+  } catch (...) {
+    rollback_beacon_arm_locked("a register access threw");
+    throw;
+  }
+  if (!armed) {
+    rollback_beacon_arm_locked("a register write was refused");
+    return false;
+  }
   /* Retain the MPDU + interval for the TBTT-steer re-download
    * (AdjustBeaconTiming*): the J2 engine loses the bcn-valid latch on any
    * re-latch and the hardware does not keep the reserved-page bytes. */
@@ -1714,19 +1862,150 @@ bool RtlJaguar2Device::UpdateBeaconPayload(const uint8_t *beacon, size_t len) {
   return redownload_beacon_locked();
 }
 
-bool RtlJaguar2Device::StopBeacon() {
+uint32_t RtlJaguar2Device::GetTxDmaStatus() {
+  /* Serialized on _reg_mu against the other register-touching control
+   * calls. A failed transfer still throws. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  if (_bcn_mpdu.empty())
+  return _device.rtw_read<uint32_t>(0x0210); /* REG_TXDMA_STATUS */
+}
+
+bool RtlJaguar2Device::ReadPacketBuffer(int sel, uint32_t offset,
+                                        uint8_t *out, size_t n) {
+  /* halmac read_buf_88xx (the 88xx common code): 4 KiB windows at
+   * 0x8000..0x8FFF, TX FIFO based at window 0x780 and the LLT at 0x650,
+   * selected through the low 12 bits of REG_PKTBUF_DBG_CTRL (0x0140). */
+  uint32_t base;
+  if (sel == 0)
+    base = 0x780; /* TX FIFO */
+  else if (sel == 1)
+    base = 0x650; /* LLT */
+  else
     return false;
-  /* EN_BCN_FUNCTION off (keep DIS_TSF_UDT), beacon-queue download off,
-   * net_type back to No Link — the StartBeacon enables, reversed. */
-  _device.rtw_write8(0x0550 /* REG_BCN_CTRL */, (1u << 4));
+  /* Dword alignment and the window of the LAST byte inside the 12-bit field
+   * (src/PktBufWindow.h, pinned by tests/txqueue_selftest.cpp). The size of
+   * the selected memory is not bounded here (see the declaration). */
+  if (!devourer::pktbuf_read_fits(base, offset, n))
+    return false;
+  if (n == 0)
+    return true;
+  if (out == nullptr)
+    return false; /* nothing to write into - refused before the window moves */
+  /* The whole save/select/read/restore under _reg_mu: the window is shared
+   * with every other register user of this backend, la_capture included
+   * (which also holds _reg_mu), so a concurrent select cannot move it under
+   * this walk. */
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  uint32_t win = (offset >> 12) + base;
+  uint32_t residue = offset & 0xFFF;
+  const uint16_t saved = _device.rtw_read16(0x0140);
+  /* Restore the borrowed window on every exit, a throwing read included: a
+   * read that fails mid-walk must not leave 0x0140 pointing into the TX FIFO
+   * for the next user of the window. A destructor must not throw, so a
+   * failed restore is logged, not thrown. */
+  struct WindowRestore {
+    RtlAdapter &dev;
+    uint16_t value;
+    Logger_t &log;
+    ~WindowRestore() {
+      bool ok = false;
+      try {
+        ok = dev.rtw_write16(0x0140, value);
+      } catch (...) {
+      }
+      if (!ok) {
+        try {
+          log->warn("Jaguar2 ReadPacketBuffer: restoring REG_PKTBUF_DBG_CTRL "
+                    "(0x0140 = 0x{:04x}) failed - the debug window is left "
+                    "pointing elsewhere", value);
+        } catch (...) {
+        }
+      }
+    }
+  } restore{_device, saved, _logger};
+  const uint16_t hi = static_cast<uint16_t>(saved & 0xF000);
+  size_t got = 0;
+  while (got < n) {
+    /* A window select that did not land would make the reads below return
+     * whatever the window last mapped - refuse rather than report it. */
+    if (!_device.rtw_write16(0x0140, static_cast<uint16_t>(win | hi)))
+      return false;
+    for (uint32_t a = 0x8000 + residue; a <= 0x8FFF && got < n; a += 4) {
+      const uint32_t v = _device.rtw_read<uint32_t>(static_cast<uint16_t>(a));
+      out[got + 0] = static_cast<uint8_t>(v);
+      out[got + 1] = static_cast<uint8_t>(v >> 8);
+      out[got + 2] = static_cast<uint8_t>(v >> 16);
+      out[got + 3] = static_cast<uint8_t>(v >> 24);
+      got += 4;
+    }
+    residue = 0;
+    win++;
+  }
+  return true;
+}
+
+/* The StartBeacon enables, reversed: EN_BCN_FUNCTION off (keep DIS_TSF_UDT),
+ * beacon-queue download off, net_type back to No Link. Idempotent. Shared by
+ * StopBeacon and StartBeacon's failure rollback. Returns false if any write
+ * was refused (every write is still attempted). Caller holds _reg_mu. */
+bool RtlJaguar2Device::disable_beacon_locked() {
+  bool ok = _device.rtw_write8(0x0550 /* REG_BCN_CTRL */, (1u << 4));
   uint32_t txq = _device.rtw_read<uint32_t>(0x0420 /* REG_FWHW_TXQ_CTRL */);
-  _device.rtw_write<uint32_t>(0x0420, txq & ~(1u << 22) /* BIT_EN_BCNQ_DL */);
+  ok = _device.rtw_write<uint32_t>(0x0420,
+                                   txq & ~(1u << 22) /* BIT_EN_BCNQ_DL */) &&
+       ok;
   uint8_t nt = _device.rtw_read8(0x0102);
-  _device.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+  ok = _device.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u)) && ok;
+  return ok;
+}
+
+/* Undo a StartBeacon that failed after its first enabling write (a register
+ * write refused, or an access that threw). The beacon is OFF after this - a
+ * failed RE-arm included, since the disable also stops the previous beacon -
+ * so its active-state record goes too, and every timing/payload call
+ * (UpdateBeaconPayload, the TBTT steers, PinBeaconTbtt) refuses as for no
+ * beacon. If the disable itself does not land, _bcn_hw_touched stays set and
+ * StopBeacon retries it. Never throws. Caller holds _reg_mu. */
+void RtlJaguar2Device::rollback_beacon_arm_locked(const char *why) {
   _bcn_mpdu.clear();
   _bcn_interval_tu = 0;
+  _tbtt_off_us = 0;
+  bool off = false;
+  try {
+    off = disable_beacon_locked();
+  } catch (...) {
+  }
+  if (off)
+    _bcn_hw_touched = false;
+  try {
+    if (off)
+      _logger->error("beacon(J2): StartBeacon failed mid-arm ({}) - rolled back",
+                     why);
+    else
+      _logger->error("beacon(J2): StartBeacon failed mid-arm ({}) and the "
+                     "rollback did not land - StopBeacon will retry the "
+                     "disable", why);
+  } catch (...) {
+  }
+}
+
+bool RtlJaguar2Device::StopBeacon() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  /* Also when StartBeacon touched the enables but never finished arming
+   * (_bcn_hw_touched, see StartBeacon's rollback): disarm that too. */
+  if (_bcn_mpdu.empty() && !_bcn_hw_touched)
+    return false;
+  const bool off = disable_beacon_locked();
+  _bcn_mpdu.clear();
+  _bcn_interval_tu = 0;
+  if (!off) {
+    /* A refused disable write: the beacon may still be airing. Keep the
+     * touch so a retry runs the disable again, and say so. */
+    _bcn_hw_touched = true;
+    _logger->error("beacon(J2): StopBeacon - a disable write was refused; "
+                   "retry StopBeacon");
+    return false;
+  }
+  _bcn_hw_touched = false;
   _logger->info("beacon(J2): stopped (EN_BCN off, EN_BCNQ_DL off, net_type->NoLink)");
   return true;
 }
@@ -1888,9 +2167,13 @@ int32_t RtlJaguar2Device::PinBeaconTbtt(int32_t offset_us) {
 void RtlJaguar2Device::SetCcaMode(bool disabled) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   /* Both MAC carrier-sense bits in REG_TX_PTCL_CTRL: primary CCA 0x520[14] +
-   * EDCCA [15], plus EDCCA_MSK_COUNTDOWN 0x524[11]. The primary-CCA bit is the
-   * one that stops TX deferring to a co-channel transmitter; 0x520
-   * is the same HalMAC layout as the on-air-validated Jaguar3. */
+   * EDCCA [15], plus EDCCA_MSK_COUNTDOWN 0x524[11]. 0x520 is the same HalMAC
+   * layout as the on-air-validated Jaguar3, which is why the register writes
+   * are shared. Which of the two bits actually stops an injector is NOT:
+   * Jaguar3 and Jaguar1 measure opposite answers (see CLAUDE.md), and this
+   * family has no measurement of its own, so nothing here should be read as
+   * one. Jaguar2 has not ported the per-gate split — SetCcaGates is the
+   * not-ported default and this stays all-or-nothing. */
   uint32_t v520 = _device.rtw_read<uint32_t>(0x0520);
   uint32_t v524 = _device.rtw_read<uint32_t>(0x0524);
   if (disabled) { v520 |= (1u << 15) | (1u << 14); v524 &= ~(1u << 11); }
@@ -1906,24 +2189,44 @@ uint64_t RtlJaguar2Device::ReadTsf() {
    * _reg_mu (shared with the coex/thermal tick). NB starved to 0 under a heavy
    * RX bulk-IN flood — reliable from a quiet TX. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  uint32_t hi = _device.rtw_read<uint32_t>(0x0564);
-  uint32_t lo = _device.rtw_read<uint32_t>(0x0560);
-  if (_device.rtw_read<uint32_t>(0x0564) != hi) {
-    hi = _device.rtw_read<uint32_t>(0x0564);
-    lo = _device.rtw_read<uint32_t>(0x0560);
-  }
-  return (static_cast<uint64_t>(hi) << 32) | lo;
+  return devourer::read_tsftr(_device);
 }
 
-void RtlJaguar2Device::WriteTsf(uint64_t tsf) {
-  /* REG_TSFTR 0x0560 (low) / 0x0564 (high). Serialized on _reg_mu against the
-   * coex/thermal tick. The counter keeps running, so this sets it to ~tsf. */
+bool RtlJaguar2Device::WriteTsf(uint64_t tsf) {
+  /* REG_TSFTR, serialized on _reg_mu against the coex/thermal tick. The
+   * counter keeps running, so this sets it to ~tsf. Readback-measured on the
+   * RTL8822B over USB; the 8821C (USB and the 8821CE's PCIe) rides the same
+   * pair and is not separately measured. Success rule, including the PCIe
+   * readback: devourer::write_tsftr. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  _device.rtw_write<uint32_t>(0x0560, static_cast<uint32_t>(tsf));
-  _device.rtw_write<uint32_t>(0x0564, static_cast<uint32_t>(tsf >> 32));
+  return devourer::write_tsftr(_device, tsf);
 }
 
 void RtlJaguar2Device::Stop() {
+  /* The armed window dies with the session. Nothing else forgets it:
+   * with_ccx gates on _brought_up, which Stop() does not clear, so a window
+   * armed before a Stop stays visible afterwards and the next retune's note
+   * hands the caller a spoil reason earned by a session that no longer
+   * exists. Measured on an RTL8822BU with this reset removed: an
+   * arm/Stop/retune/read sequence reports spoil=retuned; with it, none.
+   *
+   * Note this Stop does NOT tear the chip down — it only joins the runtime
+   * threads below — so after the reset the sampled path still answers, with
+   * a live 2 ms window. That is why the on-air `revive` arm asserts the spoil
+   * REASON rather than the reading's validity. Scoped; neither joined thread
+   * takes the CCX lock.
+   *
+   * What this does NOT close: no lock spans this Stop(), so a concurrent
+   * ArmChannelBusy can still land after the reset and during teardown, and
+   * with_ccx gates on _brought_up, which nothing here clears — so an arm
+   * issued AFTER a Stop still succeeds against a torn-down chip.
+   * ArmChannelBusy is single-control-thread by contract (IRadio.h); closing
+   * the rest means clearing _brought_up, which gates other paths. The
+   * contract and this residual are both at IRadio::ArmChannelBusy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   stop_pwrtrack();
   stop_dig();
 }

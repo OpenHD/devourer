@@ -44,6 +44,25 @@ Jaguar1 (shared `PhyTableLoader`).
   instead (`fw_switch_confirm`). Classic 8-byte H2Cs ride the HMEBOX
   mailboxes (0x1d0/0x1f0 + 0x1cc busy bits), distinct from MacInit's 32-byte
   h2c-pkt queue.
+- **The whole MAC must be enabled before the LLT init** (`MAC_TRX_ENABLE =
+  0xFF`, halmac's value for both 8822B and 8821C; this port had the DMA-only
+  `0x0F`). The same defect and fix as Jaguar3 (`src/jaguar3/CLAUDE.md`, where
+  `0x1F` - the DMA bits + PROTOCOL_EN - was enough on the 8822C; not
+  bisected here). On an 8812BU (`rsvd_boundary` 1938 too): with `0x0F`, 4000
+  frames injected with a beacon armed overwrote page 1938 and latched
+  `TXDMA_STATUS` `0x10` then `0x15` (bits not decoded; the TBTT trigger was
+  bisected on the 8822C only) at 358 frames, then every bulk-OUT timed out;
+  with `0xFF`, 4000/4000 clean and `LLT[1937] = 0` by the end of the run.
+  The 8821C and the PCIe 8821CE ride the same constant and are unverified.
+- **Runtime threads must survive a failed register read** (the guards: the
+  DIG / thermal-track loops in `RtlJaguar2Device.cpp`). Before them, an
+  uncaught `rtw_read: iostream error` in the DIG thread terminated an 8812BU AP
+  mid-way through a 14-20 Mbit/s uplink, and the guard has fired about once
+  per throughput ladder since - it is a recurring event, not a one-off.
+  Measured on the caller side too: under a 4+4 Mbit/s 8812BU AP soak about
+  one control read a minute failed while the chip worked on, and an unguarded
+  `GetTxDmaStatus` poll killed that AP at minute 9. The poller contract is at
+  `IRtlRadio::GetTxDmaStatus`.
 
 ## TX power
 
@@ -69,3 +88,38 @@ the calibrated shape.
 
 The 8822B/8821C descriptor `TXPWR_OFSET` is a hardware LUT
 (0/-3/-7/-11/+3/+6 dB); session default via `SetTxPacketPowerStep`.
+
+## CCX energy sensing (`clm` / `nhm_env`)
+
+**`Stop()` forgets any armed busy window** — the rule, and the residual it
+does not close, are at `IRadio::ArmChannelBusy`, the one declaration site
+where they can be kept true. What is specific to this die:
+
+Measured on an RTL8822BU with the reset removed: arm, `Stop()`, retune, read
+reports `spoil=retuned`; with it, `spoil=none`. Note this `Stop()` does NOT
+tear the chip down — it only joins `stop_pwrtrack()`/`stop_dig()` — so after
+the reset the sampled path still answers, with a live 2 ms window. That is
+why the on-air `revive` arm asserts the spoil REASON rather than the reading's
+validity: asserting "invalid" would encode another family's teardown depth as
+a contract and fail this one. Neither joined thread takes the CCX lock.
+
+`GetRxEnergy(with_nhm=true)` runs the shared CCX window (`src/NhmReader.h`) on
+the 11AC register map; on-air validated on an RTL8822BU.
+
+**`nhm_env` is blind to a steady interferer here, and `dig_step()` is why.** The
+NHM thresholds are referenced to the live IGI, and this generation's DIG window
+spans `0x1c`–`0x3e` — 34 steps — and runs unconditionally. Under a 5 MHz
+non-802.11 carrier it walked IGI 28 → 40, taking the thresholds with it: the
+histogram stayed parked at bucket 2 and `nhm_env` separated by **0** across
+repetitions ("within noise") against an interferer that moved `fa_ofdm` 0 → 318.
+`clm` still separated, but only 0 → 4. Narrowing this window, or pinning IGI
+across the NHM window, is the fix — both are constants in our own code.
+
+The quiet-channel half does work: `[0,0,255,0,…]` reduces to `busy` 100 /
+`ratio` 100 / **`env` 0**, which is the defect `ChannelScore.cpp` cites (by
+name, on this chip) as its reason for excluding NHM from scoring.
+
+In a **TX session** every counter including `clm` pins at zero with a carrier
+present that the same adapter measures fine in RX — so CLM does not unblock
+TX-side sensing here, and dying alongside FA/CCA points at a shared counter/CCX
+enable the TX bring-up never sets rather than at the DIG loop.

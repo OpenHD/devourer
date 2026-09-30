@@ -217,6 +217,11 @@ struct Rx8822cFrame {
   uint8_t shift;         /* SHIFT_SZ */
   uint32_t tsfl;         /* hardware TSF-low at receive */
   bool paggr;            /* MPDU arrived inside an A-MPDU */
+  bool physt;            /* a PHY-status report was written for THIS frame;
+                          * drvinfo space is reserved on every frame
+                          * (RX_DRVINFO_SZ is global), so without this bit the
+                          * area holds stale bytes — notably on all-but-one
+                          * subframe of an A-MPDU */
   uint8_t ppdu_cnt;      /* 2-bit received-PPDU counter */
   uint32_t next_offset;  /* 8-byte-aligned offset of the next frame in an agg */
 };
@@ -239,6 +244,7 @@ inline bool parse_rx_8822c(const uint8_t *buf, size_t buflen,
   out.rx_rate = static_cast<uint8_t>(GET_RX_DESC_RX_RATE_8822C(buf));
   out.tsfl = static_cast<uint32_t>(GET_RX_DESC_TSFL_8822C(buf));
   out.paggr = GET_RX_DESC_PAGGR_8822C(buf) != 0;
+  out.physt = GET_RX_DESC_PHYST_8822C(buf) != 0;
   out.ppdu_cnt = static_cast<uint8_t>(GET_RX_DESC_PPDU_CNT_8822C(buf));
 
   uint32_t frame_off =
@@ -269,16 +275,24 @@ inline bool parse_rx_8822c(const uint8_t *buf, size_t buflen,
  * vendor's s(8,1) fields). The page type is taken from byte0 low nibble
  * (page_num) rather than guessed from the rate: 0 = CCK type0, else an OFDM
  * page; per-stream EVM/SNR are only present on the type1 OFDM page.
- * Requires physts_len >= 28. */
-inline void parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
-                               rx_pkt_attrib &a) {
+ * `configured_bw` is the card's currently-tuned bandwidth (0/1/2 = 20/40/80
+ * MHz, same encoding as `a.bw`) — see the rxsc-to-bw comment below.
+ *
+ * Requires physts_len >= 28. Returns which fields of `a` were filled
+ * (PhyStsFill): None on a null/short buffer, Full only on the type1 OFDM page
+ * that carries EVM/SNR/CFO, Power on the CCK page and on every other OFDM page
+ * — those share the common header, so their per-path power (and ldpc/stbc/bw)
+ * IS a measurement even though the type1-only fields are left at 0. Callers
+ * must not fold a field the return value does not claim. */
+inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
+                                     uint8_t configured_bw, rx_pkt_attrib &a) {
   if (physts == nullptr || physts_len < 28)
-    return;
+    return PhyStsFill::None;
   const uint8_t page_num = physts[0] & 0x0f;
   if (page_num == 0) {
     /* type0 (CCK): DW0 = page_num(0), pwdb_a(1). Single path-A power. */
     a.rssi[0] = physts[1];
-    return;
+    return PhyStsFill::Power;
   }
   /* OFDM header (valid for every jgr3 OFDM page): per-path pwdb[4] at bytes
    * 1..4, DW1 byte5 l_rxsc[3:0]/ht_rxsc[7:4], DW1 byte7 flags. */
@@ -289,10 +303,15 @@ inline void parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
   a.ldpc = (f7 >> 5) & 1;
   a.stbc = (f7 >> 6) & 1;
   /* RX bandwidth from the active rxsc: legacy OFDM uses l_rxsc, HT/VHT uses
-   * ht_rxsc; rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz (phydm_rxsc_2_bw). */
+   * ht_rxsc; rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz (phydm_rxsc_2_bw).
+   * phydm_rxsc_2_bw: RXSC 0 means the packet occupied the receiver's full
+   * configured bandwidth. Legacy OFDM remains 20 MHz; the full-width sentinel
+   * matters for HT, where an HT40 packet otherwise gets misreported as 20. */
   const uint8_t l_rxsc = physts[5] & 0x0f, ht_rxsc = (physts[5] >> 4) & 0x0f;
   const uint8_t rxsc = (a.data_rate >= 4 && a.data_rate <= 11) ? l_rxsc : ht_rxsc;
-  a.bw = rxsc >= 13 ? 2 : rxsc >= 9 ? 1 : 0;
+  a.bw = rxsc == 0 && a.data_rate >= 12
+             ? configured_bw
+             : rxsc >= 13 ? 2 : rxsc >= 9 ? 1 : 0;
   /* Per-stream EVM/SNR + per-path CFO tail only exist on the type1 page
    * (phy_sts_rpt_jgr3_type1: DW4 rxevm[4] at 16..19, DW5 cfo_tail[4] at
    * 20..23, DW6 rxsnr[4] at 24..27); other OFDM pages (2/3/4/5/6) reuse those
@@ -303,7 +322,15 @@ inline void parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
       a.evm[i] = static_cast<int8_t>(physts[16 + i]);
       a.snr[i] = static_cast<int8_t>(physts[24 + i]);
     }
+    return PhyStsFill::Full;
   }
+  /* Pages 2..6: the common header above was parsed and is valid, so this is a
+   * Power fill rather than a failure — reporting None here would throw away
+   * real per-path RSSI, and would silently freeze GetRxQuality/GetActiveRxPaths
+   * if the BB page selector ever left type1 (devourer's BB table pins
+   * 0x8C0[25:22]=1, but the vendor auto-switch and debug page helpers do not
+   * restore it). */
+  return PhyStsFill::Power;
 }
 
 } /* namespace jaguar3 */

@@ -1,0 +1,63 @@
+name: Sync from OpenIPC upstream
+
+on:
+  schedule:
+    # Daily at 03:17 UTC. The non-round minute avoids peak Actions load.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: devourer-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync master and OpenHD branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          submodules: false
+
+      - name: Merge upstream changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/OpenIPC/devourer.git
+          git fetch --no-tags upstream master
+
+          # Workflow files stay owned by the OpenHD fork. GITHUB_TOKEN cannot
+          # push upstream workflow changes, and importing them would also let
+          # upstream redefine jobs that run with this fork's credentials.
+          if ! git merge-base --is-ancestor upstream/master HEAD; then
+            git merge --no-commit --no-ff upstream/master
+            git rm -r --quiet --ignore-unmatch .github/workflows
+            git checkout HEAD -- .github/workflows
+            git commit --no-edit
+          fi
+          git push origin HEAD:master
+
+          # Keep the OpenHD FHSS and hardware fixes on top of synchronized
+          # upstream master.
+          git fetch --no-tags origin openhd-fhss-session
+          git switch --create openhd-fhss-session --track origin/openhd-fhss-session
+          git merge --no-edit master
+          git push origin HEAD:openhd-fhss-session
+
+          # OpenHD pins the runtime-logging branch. It must inherit the FHSS
+          # branch as well as master so USB2 and other OpenHD fixes are present.
+          git fetch --no-tags origin openhd-runtime-logging
+          git switch --create openhd-runtime-logging --track origin/openhd-runtime-logging
+          git merge --no-edit openhd-fhss-session
+          git push origin HEAD:openhd-runtime-logging

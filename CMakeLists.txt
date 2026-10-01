@@ -391,12 +391,14 @@ if(DEVOURER_MT7612U)
         src/mt7612u/phy.cpp
         src/mt7612u/radiotap.cpp
         src/mt7612u/rx.cpp
+        src/mt7612u/station.cpp
         src/mt7612u/tx.cpp
         src/mt7612u/usb.cpp
         src/mt7612u/Mt7612uRadio.cpp src/mt7612u/Mt7612uRadio.h
         src/mt7612u/Mt7612uMapping.h
         src/mt7612u/Mt7612uRxQueue.h
         src/mt7612u/Mt7612uTsfRead.h
+        src/mt7612u/StationIdentity.h
         src/mt7612u/internal.h
         src/mt7612u/regs.h
         src/mt7612u/initvals.h
@@ -1102,6 +1104,22 @@ target_include_directories(BssTableSelftest PRIVATE
 target_compile_features(BssTableSelftest PRIVATE cxx_std_20)
 add_test(NAME bss_table COMMAND BssTableSelftest)
 
+# The MT7612U station-identity decision and the ownership hand-off
+# (src/mt7612u/StationIdentity.h), in the style of
+# tests/ack_responder_selftest.cpp. The policy is split from the register I/O
+# so it can run here: its failure modes (a failed read that fails open, a
+# failed read-back taken for a moved identity) are decisions, not writes, and
+# are not visible in a register trace. Hardware coverage is
+# `mt7612uprobe staid`. Header-only and pure, so it needs no link against the
+# library.
+if(DEVOURER_MT7612U)
+    add_executable(Mt7612uStationSelftest tests/mt7612u_station_selftest.cpp)
+    target_include_directories(Mt7612uStationSelftest PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+    target_compile_features(Mt7612uStationSelftest PRIVATE cxx_std_20)
+    add_test(NAME mt7612u_station_identity COMMAND Mt7612uStationSelftest)
+endif()
+
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on
@@ -1216,6 +1234,17 @@ target_link_libraries(RadiotapNoackSelftest PRIVATE devourer)
 target_include_directories(RadiotapNoackSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME radiotap_noack COMMAND RadiotapNoackSelftest)
+
+# Headless guard for TxMode::no_agg's wire form - the devourer-private
+# TX_FLAGS bit that keeps a frame out of an A-MPDU (RadiotapTxFlags.h). Every
+# builder layout, NOACK both ways, and the /NOAGG parse token.
+add_executable(RadiotapNoaggSelftest
+    tests/radiotap_noagg_selftest.cpp
+)
+target_link_libraries(RadiotapNoaggSelftest PRIVATE devourer)
+target_include_directories(RadiotapNoaggSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME radiotap_noagg COMMAND RadiotapNoaggSelftest)
 
 # Headless round-trip guard for the 802.11ax Trigger frame path (src/TriggerTwt.h
 # build_basic_trigger + he_ru_alloc, src/TriggerParse.h parse_trigger): build ->

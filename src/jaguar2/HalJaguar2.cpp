@@ -983,7 +983,10 @@ void HalJaguar2::set_channel_bw(uint8_t channel, uint8_t bw, uint8_t rfe_type,
   if (bw == 1) { /* 40 MHz */
     _device.phy_set_bb_reg(0x0a00, 1u << 4, primary_ch_idx == 1 ? 1 : 0);
     v8ac &= 0xFF3FF300;
-    v8ac |= (sub | 0x1u); /* CHANNEL_WIDTH_40 = 1 */
+    // The public offset is lower=1 / upper=2; the PHY uses
+    // VHT_DATA_SC codes lower=2 / upper=1 for its primary 20 MHz.
+    const uint8_t primary_sc = primary_ch_idx == 1 ? 2 : 1;
+    v8ac |= ((primary_sc << 2) | 0x1u); /* CHANNEL_WIDTH_40 = 1 */
     _device.phy_set_bb_reg(0x08ac, 0xffffffff, v8ac);
     _device.phy_set_bb_reg(0x08c4, (1u << 30), 0x1);
     rf18 &= ~((1u << 11) | (1u << 10));

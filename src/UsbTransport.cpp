@@ -1386,8 +1386,11 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                                 static_cast<int>(length), &actual, timeout_ms);
   if (rc != LIBUSB_SUCCESS) {
     _tx_failed.fetch_add(1, std::memory_order_relaxed);
-    _tx_last_rc.store(rc, std::memory_order_relaxed);
-    _tx_last_timeout.store(rc == LIBUSB_ERROR_TIMEOUT,
+    // A cancelled prefix leaves Realtek TXDMA expecting the rest of this
+    // frame. Sending another descriptor into that tail wedges the FIFO.
+    _tx_last_rc.store(actual > 0 ? devourer::kTxShortWriteRc : rc,
+                      std::memory_order_relaxed);
+    _tx_last_timeout.store(actual == 0 && rc == LIBUSB_ERROR_TIMEOUT,
                            std::memory_order_relaxed);
     _logger->error("bulk_send EP {} FAIL rc={} got {}/{}", (int)ep, rc, actual,
                    (int)length);
@@ -1416,6 +1419,10 @@ int UsbTransport::tx_sync_data(uint8_t ep, uint8_t *packet, size_t length,
   if (_tx_no_cancel_multipkt)
     timeout_ms = devourer::bulk_out_timeout_ms(length, _bulk_out_mps,
                                                timeout_ms);
+  // Video bursts can keep the FIFO busy longer than the per-chip 20 ms
+  // default. Keep a finite bound for shutdown and let the caller recover a
+  // genuinely stuck radio instead of cancelling healthy bursts.
+  if (timeout_ms > 0) timeout_ms = std::max(timeout_ms, 200);
   return tx_sync(ep, packet, length, timeout_ms);
 }
 

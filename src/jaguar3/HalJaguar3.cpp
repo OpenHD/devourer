@@ -131,15 +131,13 @@ void HalJaguar3::rtw_hal_init(SelectedChannel channel) {
   timer.stage("init_system_cfg");
 
   if (!_fw.download_default_firmware()) {
-    _logger->error("Jaguar3: firmware download FAILED (structured)");
-    return;
+    throw std::runtime_error("Jaguar3: firmware download failed");
   }
   _logger->info("Jaguar3: firmware booted (structured)");
   timer.stage("dlfw");
 
   if (!_macinit.init_mac_cfg(bw)) {
-    _logger->error("Jaguar3: init_mac_cfg FAILED (structured)");
-    return;
+    throw std::runtime_error("Jaguar3: MAC initialization failed");
   }
   timer.stage("init_mac_cfg");
   /* Propagate the queue-init reserved-page boundary to the FW downloader — it

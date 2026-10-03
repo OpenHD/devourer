@@ -31,6 +31,12 @@ namespace jaguar3 {
 
 inline constexpr size_t kPerQueueMinEps = 3;
 
+// ChannelOffset 1 places the secondary above the primary; 2 places it below.
+// The descriptor uses the opposite convention: 2 = lower, 1 = upper.
+constexpr uint8_t primary20_subchannel(uint8_t channel_offset) {
+  return channel_offset == 1 ? 2 : channel_offset == 2 ? 1 : 0;
+}
+
 /* True when data frames leave the HIGH queue (see above). build_tx_block and
  * peek_tx_qsel both key their data-QSEL write on this. */
 constexpr bool per_queue_routing(size_t n_eps) {

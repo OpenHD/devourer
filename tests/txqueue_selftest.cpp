@@ -34,6 +34,12 @@ static int g_fail = 0;
 
 #if defined(DEVOURER_HAVE_JAGUAR3)
 static void test_queue_map() {
+  CHECK(jaguar3::primary20_subchannel(1) == 2,
+        "HT40+ must send 20 MHz management on the lower primary");
+  CHECK(jaguar3::primary20_subchannel(2) == 1,
+        "HT40- must send 20 MHz management on the upper primary");
+  CHECK(jaguar3::primary20_subchannel(0) == 0,
+        "unspecified primary must retain the descriptor default");
   /* Expected index with >= 3 endpoints: BE/BK (TID 0-3) -> LOW (2),
    * VI/VO (TID 4-7) -> NORMAL (1), everything else -> HIGH (0). */
   for (unsigned eps = 0; eps <= 4; ++eps) {

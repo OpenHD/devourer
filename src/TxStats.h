@@ -18,11 +18,11 @@ namespace devourer {
  * its TX FIFO is full — recoverable back-pressure, the xtx case — whereas a
  * hard error (NO_DEVICE, pipe stall, ...) is a broken link. `last_error_rc` is
  * the raw libusb code of the most recent failure (0 = none yet), or
- * kTxShortWriteRc for a transfer libusb reported OK but short — the
+ * kTxShortWriteRc for a partial transfer, including a cancelled prefix — the
  * full-write contract counts that as a failure, and libusb has no code for
  * it. */
 
-/* Sentinel for a short bulk write (libusb success, fewer bytes than asked).
+/* Sentinel for a partial bulk write (success or error after a prefix).
  * Chosen outside every libusb error code (-1..-99) and negated-transfer-status
  * value so it can never be mistaken for one. */
 constexpr int kTxShortWriteRc = -1000;

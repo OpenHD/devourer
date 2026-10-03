@@ -1,10 +1,12 @@
 #include "RtlJaguarDevice.h"
+#include "jaguar1/BeaconPort.h"
 #include "BeamformingSounder.h"
 #include "ChannelFreq.h"
 #include "EepromManager.h"
 #include "Hal8812PhyReg.h"
 #include "NhmReader.h"
 #include "NoiseFloorMath.h" /* active idle-noise-floor sign/pwdb helpers */
+#include "RtlTsf.h" /* REG_TSFTR read/write shared with Jaguar2/3 */
 #include "RadioManagementModule.h"
 #include "AckResponder.h" /* hardware ACK responder recipe */
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
@@ -24,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 /* comma-joined 0xNN hex dump for the DVR_TRACE TX-buffer dumps (argument is
@@ -58,6 +61,31 @@ static constexpr uint16_t RF_LNA_LOW_GAIN_3 = 0x58;
 static constexpr uint16_t rC_TxScale_8814 = 0x181C;
 static constexpr uint16_t rD_TxScale_8814 = 0x1A1C;
 
+namespace {
+
+template <typename Action> class JaguarScopeExit {
+public:
+  explicit JaguarScopeExit(Action action) : _action(std::move(action)) {}
+  JaguarScopeExit(const JaguarScopeExit &) = delete;
+  JaguarScopeExit &operator=(const JaguarScopeExit &) = delete;
+  ~JaguarScopeExit() noexcept {
+    if (_active) {
+      try {
+        _action();
+      } catch (...) {
+        /* Preserve the original exception during initialization unwind. */
+      }
+    }
+  }
+  void release() noexcept { _active = false; }
+
+private:
+  Action _action;
+  bool _active = true;
+};
+
+} // namespace
+
 RtlJaguarDevice::RtlJaguarDevice(RtlAdapter device, Logger_t logger,
                                  devourer::DeviceConfig cfg)
     : _cfg{std::move(cfg)},
@@ -69,12 +97,46 @@ RtlJaguarDevice::RtlJaguarDevice(RtlAdapter device, Logger_t logger,
       _logger{logger} {}
 
 void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
+  /* Likewise a station arm: a re-Init of a live session clears an arm this
+   * object holds before the bring-up below; one whose clear does not verify
+   * stays recorded for ClearStationIdentity (StationArm::retire). */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station_ready = false;
+    _station.retire(_device, _logger, "Jaguar1");
+  }
+  std::optional<uint64_t> configured_arm_generation;
+  JaguarScopeExit rollback([&] {
+    if (!configured_arm_generation)
+      return;
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    if (!ack_arm_token_is_current(*configured_arm_generation)) {
+      _logger->info("Jaguar1: post-arm InitWrite rollback found its ACK arm "
+                    "cleared or replaced; leaving the current port unchanged");
+      return;
+    }
+    if (!disarm_ack_responder())
+      _logger->error("Jaguar1: post-arm InitWrite rollback was not fully "
+                     "verified; see the register-specific error above");
+  });
   StartWithMonitorMode(channel);
   SetMonitorChannel(channel);
   _logger->info("In Monitor Mode");
 
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder) { /* DEVOURER_ACK_RESPONDER */
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    if (!SetAckResponder(*_cfg.rx.ack_responder))
+      throw std::runtime_error(
+          "Jaguar1: configured ACK responder could not be armed");
+    configured_arm_generation = _active_ack_arm_generation;
+  }
 
   /* Carrier-sense default: EDCCA + primary CCA enabled unless
    * DEVOURER_DIS_CCA. Always applied — the enable path is what programs
@@ -108,6 +170,11 @@ void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
 
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station_ready = true; /* every port-0 write of this bring-up is done */
+  }
+  rollback.release();
 }
 
 /* MP single-tone (CW carrier), Jaguar-1 path A. The RF writes are common to the
@@ -305,8 +372,16 @@ RxEnergy RtlJaguarDevice::GetRxEnergy(bool with_nhm) {
 
   /* NHM 12-bucket power histogram (frame-free, 11AC register map). Skipped
    * when the caller did not ask: it arms a ~2 ms window and polls at 1 ms
-   * granularity, which dwarfs the register reads above. */
-  if (with_nhm)
+   * granularity, which dwarfs the register reads above.
+   *
+   * Under the CCX lock, together with the note: this read RE-ARMS the shared
+   * engine, so it spoils any window ArmChannelBusy set up, and the note must
+   * not be able to land before a concurrent arm while the re-arm lands after
+   * it — that ordering is what turns a destroyed window into a valid-looking
+   * reading. */
+  if (with_nhm) {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_nhm_read();
     devourer::read_nhm(
       devourer::nhm_regs_11ac(), e.igi,
       [this](uint16_t a) { return _device.rtw_read<uint32_t>(a); },
@@ -314,6 +389,7 @@ RxEnergy RtlJaguarDevice::GetRxEnergy(bool with_nhm) {
         _device.phy_set_bb_reg(a, m, v);
       },
       e);
+  }
 
   /* Active absolute floor: the debug-port measurement wedges live RX, so
    * it is NOT re-run here — GetRxEnergy just surfaces the RX-idle CAL taken at
@@ -394,15 +470,19 @@ bool RtlJaguarDevice::GetPermanentMacAddress(uint8_t out[6]) {
 }
 
 uint64_t RtlJaguarDevice::ReadTsf() {
-  /* REG_TSFTR (0x0560) = TSF low 32, 0x0564 = TSF high 32. Read hi, lo, hi
-   * again and retry the pair once if the low word wrapped between the reads. */
-  uint32_t hi = _device.rtw_read<uint32_t>(0x0564);
-  uint32_t lo = _device.rtw_read<uint32_t>(0x0560);
-  if (_device.rtw_read<uint32_t>(0x0564) != hi) {
-    hi = _device.rtw_read<uint32_t>(0x0564);
-    lo = _device.rtw_read<uint32_t>(0x0560);
-  }
-  return (static_cast<uint64_t>(hi) << 32) | lo;
+  return devourer::read_tsftr(_device);
+}
+
+bool RtlJaguarDevice::WriteTsf(uint64_t tsf) {
+  /* The bare REG_TSFTR pair, without the beacon-steer bracket. Under _port0_mu
+   * so it cannot interleave with a PinBeaconTbtt/AdjustBeaconTimingFine
+   * sequence, which writes the same pair (PinBeaconTbtt's restore step is
+   * this same bare write). The raw pair is readback-measured on an RTL8821AU
+   * (scratch probe, no beacon armed, both word orders); this override has not
+   * itself run on Jaguar1 hardware, and the 8812AU/8814AU share the register
+   * block without a separate measurement. Success rule: devourer::write_tsftr. */
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  return devourer::write_tsftr(_device, tsf);
 }
 
 bool RtlJaguarDevice::download_rsvd_beacon(const uint8_t *mpdu,
@@ -491,6 +571,17 @@ bool RtlJaguarDevice::download_rsvd_beacon(const uint8_t *mpdu,
 
 bool RtlJaguarDevice::StartBeacon(const uint8_t *beacon, size_t len,
                                   int interval_tu) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (_port0_ack_claimed) {
+    _logger->error("beacon(J1): cannot claim port 0 while an ACK "
+                   "responder is armed; clear the responder first");
+    return false;
+  }
+  if (_station.armed()) {
+    _logger->error("beacon(J1): cannot claim port 0 while a station "
+                   "identity is armed; ClearStationIdentity first");
+    return false;
+  }
   /* Mirrors RtlJaguar2Device::StartBeacon on the pre-HalMAC registers, in the
    * VENDOR ORDER: port/beacon configuration first, reserved-page download
    * LAST. A download issued before the port is configured latches BCN_VALID
@@ -502,6 +593,7 @@ bool RtlJaguarDevice::StartBeacon(const uint8_t *beacon, size_t len,
   if (rt > len) rt = 0;
   const uint8_t *mpdu = beacon + rt;
   size_t mpdu_len = len - rt;
+  _port0_beacon_claimed = true;
   /* Port identity: MAC (REG_MACID 0x0610) + BSSID (REG_BSSID 0x0618) from the
    * MPDU's addr2/addr3. */
   if (mpdu_len >= 24) {
@@ -579,7 +671,8 @@ bool RtlJaguarDevice::StartBeacon(const uint8_t *beacon, size_t len,
 }
 
 bool RtlJaguarDevice::UpdateBeaconPayload(const uint8_t *beacon, size_t len) {
-  if (_bcn_mpdu.empty()) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!_port0_beacon_claimed || _bcn_mpdu.empty()) {
     _logger->error("beacon(J1): UpdateBeaconPayload without an active beacon");
     return false;
   }
@@ -598,22 +691,34 @@ bool RtlJaguarDevice::UpdateBeaconPayload(const uint8_t *beacon, size_t len) {
 }
 
 bool RtlJaguarDevice::StopBeacon() {
-  if (_bcn_mpdu.empty())
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!_port0_beacon_claimed)
     return false;
   /* EN_BCN_FUNCTION off (keep DIS_TSF_UDT), StopTxBeacon (0x422[6] clear —
-   * the ResumeTxBeacon inverse), net_type back to No Link. */
-  _device.rtw_write8(0x0550 /* REG_BCN_CTRL */, 0x10);
-  _device.rtw_write8(0x0422, static_cast<uint8_t>(
-                                 _device.rtw_read8(0x0422) & ~0x40u));
-  uint8_t nt = _device.rtw_read8(0x0102);
-  _device.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+   * the ResumeTxBeacon inverse), net_type back to No Link. The engine runs
+   * autonomously, so retain ownership unless all three controls read back
+   * inactive; otherwise ACK setup could overwrite a beacon that still airs. */
+  const auto stopped =
+      devourer::jaguar1::stop_port0_beacon_verified(_device);
+  if (!stopped.verified()) {
+    _logger->error(
+        "beacon(J1): stop not verified (EN_BCN_FUNCTION_off={}, "
+        "StopTxBeacon={}, net_type_NoLink={}); port 0 remains beacon-owned",
+        stopped.function_off, stopped.tx_stopped, stopped.no_link);
+    return false;
+  }
+  if (!stopped.transfers_ok)
+    _logger->warn("beacon(J1): a stop write reported a transport failure, "
+                  "but all stop controls read back inactive");
   _bcn_mpdu.clear();
   _bcn_interval_tu = 0;
+  _port0_beacon_claimed = false;
   _logger->info("beacon(J1): stopped (EN_BCN off, StopTxBeacon, net_type->NoLink)");
   return true;
 }
 
 int32_t RtlJaguarDevice::AdjustBeaconTiming(int32_t microseconds) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
   int nominal = _bcn_interval_tu;
   if (nominal <= 0) return 0;  // no active beacon
   int delta_tu = (microseconds >= 0 ? microseconds + 512 : microseconds - 512) / 1024;
@@ -629,6 +734,7 @@ int32_t RtlJaguarDevice::AdjustBeaconTiming(int32_t microseconds) {
 }
 
 int32_t RtlJaguarDevice::AdjustBeaconTimingFine(int32_t microseconds) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
   if (_bcn_interval_tu <= 0) return 0;  // no active beacon
   /* The J2 fine steer on the same registers: beacon function off, shift the
    * port-0 TSF, back on (TBTT re-derives from the shifted TSF), then
@@ -661,6 +767,7 @@ int32_t RtlJaguarDevice::AdjustBeaconTimingFine(int32_t microseconds) {
 }
 
 int32_t RtlJaguarDevice::PinBeaconTbtt(int32_t offset_us) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
   if (_bcn_interval_tu <= 0) return 0;  // no active beacon
   const int64_t period_us = static_cast<int64_t>(_bcn_interval_tu) * 1024;
   const int64_t off =
@@ -754,9 +861,87 @@ bool RtlJaguarDevice::send_packet(const uint8_t *packet, size_t length) {
 }
 
 bool RtlJaguarDevice::SetAckResponder(const devourer::MacAddr &mac) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!devourer::ack::is_unicast(mac.data())) {
+    /* A station cannot ACK-target a group address, so this arm could never
+     * fire. Refusing beats returning true for a responder that will read as
+     * silently dead — the shape AdapterCaps.h records from the 8821AU
+     * episode. Only the precondition is enforced here: adopting the shared
+     * readback verify() too wants a bench cell per die, since a family whose
+     * 0x0102 does not read back would start refusing healthy arms. */
+    _logger->error("{}: ACK responder needs a UNICAST MAC (I/G set in "
+                   "{:02x}) — not armed",
+                   "Jaguar1", mac.bytes[0]);
+    return false;
+  }
+  if (_port0_beacon_claimed) {
+    _logger->error("Jaguar1: ACK responder cannot be armed while the port-0 "
+                   "beacon owns MACID/BSSID/net_type");
+    return false;
+  }
+  if (_station.armed()) {
+    _logger->error("Jaguar1: ACK responder cannot be armed while a station "
+                   "identity owns port 0; ClearStationIdentity first");
+    return false;
+  }
+  if (_eepromManager->version_id.ICType == CHIP_8812) {
+    const bool had_restore_identity = _ack_restore_identity.has_value();
+    if (!_ack_restore_identity) {
+      devourer::ack::PortIdentity identity;
+      if (!devourer::ack::snapshot_port_identity(_device, identity)) {
+        _logger->error("Jaguar1/CHIP_8812: ACK responder cannot be armed: "
+                       "the current port identity could not be read");
+        return false;
+      }
+      if (!devourer::ack::has_safe_restore_mac(identity)) {
+        _logger->error("Jaguar1/CHIP_8812: ACK responder cannot be armed: "
+                       "the current MACID is not a safe rollback identity");
+        return false;
+      }
+      _ack_restore_identity = identity;
+    }
+    if (!devourer::ack::disarmable_by_retarget(
+            mac.data(), *_ack_restore_identity)) {
+      _logger->error("Jaguar1/CHIP_8812: ACK responder cannot be armed to "
+                     "the pre-arm MACID: this die keeps answering after "
+                     "NoLink, so Clear could not move it off that address");
+      if (!had_restore_identity)
+        _ack_restore_identity.reset();
+      return false;
+    }
+  }
+  /* Claim before the first register mutation. A failed arm clears this only
+   * after its rollback verifies; otherwise beacon setup remains blocked and a
+   * later ClearAckResponder can retry the incomplete cleanup. Invalidate any
+   * prior successful-arm token before mutation so its delayed clear cannot act
+   * on a failed or partially applied replacement. */
+  _port0_ack_claimed = true;
+  _active_ack_arm_generation.reset();
   /* Hardware ACK responder (src/AckResponder.h) — same register recipe as
    * the HalMAC generations (0x610/0x618/0x102 are map-identical here). */
-  devourer::ack::enable(_device, mac.data());
+  if (!devourer::ack::enable(_device, mac.data())) {
+    if (!disarm_ack_responder()) {
+      _logger->error("Jaguar1: ACK responder arm failed and rollback did "
+                     "not fully verify; see the register-specific error above");
+    } else {
+      _logger->error("Jaguar1: ACK responder arm register write failed; "
+                     "responder rollback was verified");
+    }
+    return false;
+  }
+  if (_eepromManager->version_id.ICType == CHIP_8812 &&
+      !devourer::ack::verify(_device, mac.data())) {
+    if (!disarm_ack_responder()) {
+      _logger->error("Jaguar1/CHIP_8812: ACK responder arm readback failed "
+                     "and rollback was not fully verified");
+    } else {
+      _logger->error("Jaguar1/CHIP_8812: ACK responder arm readback failed; "
+                     "responder rollback was verified");
+    }
+    return false;
+  }
+  ++_ack_arm_generation;
+  _active_ack_arm_generation = _ack_arm_generation;
   _logger->info("Jaguar1: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
@@ -764,21 +949,163 @@ bool RtlJaguarDevice::SetAckResponder(const devourer::MacAddr &mac) {
   return true;
 }
 
+bool RtlJaguarDevice::disarm_ack_responder() {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+
+  /* A clear without ACK ownership must not close net_type: port 0 may belong
+   * to a beacon, including a setup that failed after its first mutation. */
+  if (!_port0_ack_claimed) {
+    _logger->info("Jaguar1: no configured ACK responder to disarm");
+    return true;
+  }
+
+  if (_eepromManager->version_id.ICType == CHIP_8812 &&
+      !_ack_restore_identity) {
+    _logger->error("Jaguar1/CHIP_8812: ACK responder ownership has no "
+                   "pre-arm identity; refusing an unverifiable clear");
+    return false;
+  }
+
+  const bool gate = devourer::ack::disable_verified(_device);
+
+  /* The RTL8812AU bench result is the same safety failure as RTL8733B but not
+   * the same gate model: NoLink reads back successfully, yet the old responder
+   * MAC continues answering soliciting frames with SIFS ACKs. Restore the
+   * identity on CHIP_8812 (8812AU and its 1T1R 8811AU cut) while leaving the
+   * unmeasured 8814A/8821A clear path unchanged. */
+  if (_eepromManager->version_id.ICType != CHIP_8812) {
+    if (!gate) {
+      _logger->error("Jaguar1: ACK responder disarm did not latch");
+      return false;
+    }
+    _port0_ack_claimed = false;
+    _active_ack_arm_generation.reset();
+    _logger->info("Jaguar1: hardware ACK responder disarmed "
+                  "(net_type=NoLink)");
+    return true;
+  }
+
+  const bool transfer = devourer::ack::restore_port_identity(
+      _device, *_ack_restore_identity);
+  const bool identity = devourer::ack::port_identity_is(
+      _device, *_ack_restore_identity);
+  if (!gate) {
+    if (identity) {
+      _logger->error("Jaguar1/CHIP_8812: configured responder identity was "
+                     "removed, but net_type did not read NoLink; pre-arm "
+                     "port state was not fully restored");
+    } else {
+      _logger->error("Jaguar1/CHIP_8812: ACK responder gate did not latch "
+                     "closed and pre-arm MACID/BSSID was not restored");
+    }
+    return false;
+  }
+  if (!identity) {
+    _logger->error("Jaguar1/CHIP_8812: pre-arm MACID/BSSID could not be "
+                   "restored; the port may still answer for the responder "
+                   "address");
+    return false;
+  }
+  if (!transfer)
+    _logger->warn("Jaguar1/CHIP_8812: port-identity restore reported a "
+                  "transport failure, but MACID/BSSID readback confirms the "
+                  "pre-arm values");
+  _ack_restore_identity.reset();
+  _port0_ack_claimed = false;
+  _active_ack_arm_generation.reset();
+  _logger->info("Jaguar1/CHIP_8812: hardware ACK responder disarmed "
+                "(MACID/BSSID back to the pre-arm identity; "
+                "net_type=NoLink)");
+  return true;
+}
+
+bool RtlJaguarDevice::SetStationIdentity(const devourer::MacAddr &own,
+                                         const devourer::MacAddr &bssid) {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  if (!_station_ready) {
+    _logger->error("Jaguar1: station identity refused until bring-up "
+                   "(Init/InitWrite) has finished");
+    return false;
+  }
+  if (_port0_beacon_claimed || _port0_ack_claimed) {
+    _logger->error("Jaguar1: station identity refused: port 0 is claimed "
+                   "by the {}",
+                   _port0_beacon_claimed ? "beacon" : "ACK responder");
+    return false;
+  }
+  /* The 8814A descriptor keeps the vendor DATA_RETRY_LIMIT=0 whatever
+   * tx.retry_limit says (tx_retry_limit_ok), so a station there sends every
+   * unicast once - nullopt makes the arm say that. */
+  std::optional<int> retry;
+  if (_eepromManager->version_id.ICType != CHIP_8814A)
+    retry = _cfg.tx.retry_limit;
+  return _station.arm(_device, own, bssid, retry, _logger, "Jaguar1");
+}
+
+bool RtlJaguarDevice::ClearStationIdentity() {
+  std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+  return _station.clear(_device, _logger, "Jaguar1");
+}
+
 void RtlJaguarDevice::ClearAckResponder() {
-  devourer::ack::disable(_device);
-  _logger->info("Jaguar1: hardware ACK responder disarmed (net_type=NoLink)");
+  (void)disarm_ack_responder();
+}
+
+bool RtlJaguarDevice::GetCcaGates(bool &primary_disabled, bool &edcca_disabled) {
+  /* The MAC register is meaningless before bring-up, and reporting whatever
+   * the bus returns as the gate state would be a fabricated measurement. */
+  if (!_brought_up)
+    return false;
+  const uint32_t v = _device.rtw_read<uint32_t>(0x0520);
+  primary_disabled = (v & (1u << 14)) != 0;
+  edcca_disabled = (v & (1u << 15)) != 0;
+  return true;
+}
+
+bool RtlJaguarDevice::SetCcaGates(bool primary_disabled, bool edcca_disabled) {
+  if (!_brought_up)
+    return false;
+  apply_cca(primary_disabled, edcca_disabled);
+  _logger->info("Jaguar1: CCA gates primary={} edcca={}",
+                primary_disabled ? "OFF" : "on",
+                edcca_disabled ? "OFF" : "on");
+  return true;
 }
 
 void RtlJaguarDevice::SetCcaMode(bool disabled) {
+  apply_cca(disabled, disabled);
+  _logger->info("Jaguar1: MAC carrier-sense {}",
+                disabled ? "DISABLED (dis_cca: CCA+EDCCA)"
+                         : "enabled (default)");
+}
+
+void RtlJaguarDevice::apply_cca(bool primary_disabled, bool edcca_disabled) {
   /* MAC carrier-sense gate: the same REG_TX_PTCL_CTRL bits as the HalMAC
    * generations — the vendor's phydm_mac_edcca_state drives 0x520[15] on
-   * this family too; [14] is the primary-CCA defer. */
+   * this family too; [14] is the primary-CCA defer. A set bit disables. */
   uint32_t v520 = _device.rtw_read<uint32_t>(0x0520);
-  if (disabled)
-    v520 |= (1u << 15) | (1u << 14);
+  if (primary_disabled)
+    v520 |= (1u << 14);
   else
-    v520 &= ~((1u << 15) | (1u << 14));
+    v520 &= ~(1u << 14);
+  if (edcca_disabled)
+    v520 |= (1u << 15);
+  else
+    v520 &= ~(1u << 15);
   _device.rtw_write<uint32_t>(0x0520, v520);
+
+  /* Stop the EDCCA tracker BEFORE touching 0x8a4, not after. The phydm
+   * watchdog owns that register while tracking, and it runs on its own
+   * thread from rtw_hal_init — i.e. already before bring-up's SetCcaMode.
+   * Clearing the flag last left a window in which a tick could re-derive
+   * L2H from IGI and overwrite the park, leaving live thresholds behind a
+   * disable the caller had asked for. SetEdccaTrack is synchronous, so once
+   * it returns the writes below are ours. The enable direction hands the
+   * register over only after it is programmed, at the end of this function.
+   * Harmless when no watchdog was built (the default config). */
+  if (edcca_disabled)
+    if (auto *wd = _halModule.phydm_watchdog())
+      wd->SetEdccaTrack(false);
 
   /* BB EDCCA thresholds (rEDCCA_Jaguar 0x8a4: L2H byte0 / H2L byte1). The
    * BB init table parks them at 0x7f/0x7f = never-trigger — the vendor's
@@ -787,7 +1114,7 @@ void RtlJaguarDevice::SetCcaMode(bool disabled) {
    * honour — enable must program the vendor operating point from the live
    * IGI for EDCCA to exist at all; disable re-parks. */
   const auto ic = _eepromManager->version_id.ICType;
-  if (disabled) {
+  if (edcca_disabled) {
     _device.phy_set_bb_reg(0x8a4, 0xFFFF, 0x7f7f);
   } else {
     const int8_t th_ini = ic == CHIP_8814A ? -14 : -17;
@@ -806,12 +1133,11 @@ void RtlJaguarDevice::SetCcaMode(bool disabled) {
                   l2h, l2h - 7, igi);
   }
   /* With the watchdog running, DIG walks IGI — hand it the re-track so the
-   * threshold follows (vendor couples them per adaptivity cycle). */
-  if (auto *wd = _halModule.phydm_watchdog())
-    wd->SetEdccaTrack(!disabled);
-  _logger->info("Jaguar1: MAC carrier-sense {}",
-                disabled ? "DISABLED (dis_cca: CCA+EDCCA)"
-                         : "enabled (default)");
+   * threshold follows (vendor couples them per adaptivity cycle). Only the
+   * enable direction is done here; the disable ran above, before the park. */
+  if (!edcca_disabled)
+    if (auto *wd = _halModule.phydm_watchdog())
+      wd->SetEdccaTrack(true);
 }
 
 bool RtlJaguarDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
@@ -860,7 +1186,7 @@ size_t RtlJaguarDevice::send_packets(const TxPacketView *pkts, size_t count) {
    * rules in src/TxAggPlan.h. Knob off -> the interface-default loop. */
   const unsigned agg = _cfg.tx.usb_agg_max;
   if (agg <= 1 || !_device.is_usb() || count == 0)
-    return IRtlDevice::send_packets(pkts, count);
+    return IRadio::send_packets(pkts, count);
 
   devourer::TxAggLimits lim;
   lim.desc_size = TXDESC_SIZE;
@@ -1341,11 +1667,46 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
 
 void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
                           SelectedChannel channel) {
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
+  /* Likewise a station arm: a re-Init of a live session clears an arm this
+   * object holds before the bring-up below; one whose clear does not verify
+   * stays recorded for ClearStationIdentity (StationArm::retire). */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station_ready = false;
+    _station.retire(_device, _logger, "Jaguar1");
+  }
+  std::optional<uint64_t> configured_arm_generation;
+  JaguarScopeExit rollback([&] {
+    if (!configured_arm_generation)
+      return;
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    if (!ack_arm_token_is_current(*configured_arm_generation)) {
+      _logger->info("Jaguar1: post-arm Init rollback found its ACK arm cleared "
+                    "or replaced; leaving the current port unchanged");
+      return;
+    }
+    if (!disarm_ack_responder())
+      _logger->error("Jaguar1: post-arm Init rollback was not fully verified; "
+                     "see the register-specific error above");
+  });
   StartWithMonitorMode(channel);
   SetMonitorChannel(channel);
 
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder) { /* DEVOURER_ACK_RESPONDER */
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    if (!SetAckResponder(*_cfg.rx.ack_responder)) {
+      throw std::runtime_error(
+          "Jaguar1: configured ACK responder could not be armed");
+    }
+    configured_arm_generation = _active_ack_arm_generation;
+  }
 
   /* Carrier-sense default: EDCCA + primary CCA enabled unless
    * DEVOURER_DIS_CCA. Always applied — the enable path is what programs
@@ -1382,7 +1743,63 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
       _eepromManager->version_id.ICType != CHIP_8814A)
     measure_idle_noise_floor();
 
+  /* Measurement-only live disarm. The worker is created after every Init
+   * operation that can arm or reconfigure the responder, so zero ms means
+   * immediately after completed bring-up rather than before SetAckResponder.
+   * Its local lifetime also makes exceptional/normal RX-loop exit cancel and
+   * join an outstanding long-delay request. */
+  std::jthread ack_disarm_thread;
+  std::optional<uint32_t> ack_disarm_after_ms;
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    ack_disarm_after_ms = std::exchange(_ack_disarm_after_ms, std::nullopt);
+  }
+  if (ack_disarm_after_ms) {
+    const uint32_t delay_ms = *ack_disarm_after_ms;
+    if (!configured_arm_generation) {
+      _logger->error("DEVOURER_ACK_DISARM_AFTER_MS: no configured Jaguar1 "
+                     "ACK arm to associate with the delayed clear");
+    } else {
+      const uint64_t arm_generation = *configured_arm_generation;
+      ack_disarm_thread = std::jthread(
+        [this, delay_ms, arm_generation](std::stop_token stop) {
+          const auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(delay_ms);
+          while (!stop.stop_requested() &&
+                 std::chrono::steady_clock::now() < deadline) {
+            const auto left = deadline - std::chrono::steady_clock::now();
+            const auto quantum =
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::milliseconds(25));
+            std::this_thread::sleep_for(left < quantum ? left : quantum);
+          }
+          if (stop.stop_requested())
+            return;
+          std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+          if (stop.stop_requested())
+            return;
+          if (!ack_arm_token_is_current(arm_generation)) {
+            _logger->info(
+                "DEVOURER_ACK_DISARM_AFTER_MS: scheduled Jaguar1/CHIP_8812 "
+                "ACK arm was cleared or replaced; leaving the current "
+                "responder unchanged");
+            return;
+          }
+          _logger->info(
+              "DEVOURER_ACK_DISARM_AFTER_MS: disarming Jaguar1/CHIP_8812 "
+              "ACK responder {} ms after completed bring-up",
+              delay_ms);
+          (void)disarm_ack_responder();
+        });
+    }
+  }
+
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station_ready = true; /* every port-0 write of this bring-up is done */
+  }
   StartRxLoop(std::move(packetProcessor));
+  rollback.release();
 }
 
 void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
@@ -1523,7 +1940,13 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
              std::span<uint8_t>{const_cast<uint8_t *>(data), (size_t)n})) {
       if (should_stop || g_devourer_should_stop)
         break;
-      if (!p.RxAtrib.crc_err) {
+      /* physt: the descriptor says the PHY wrote a status report for THIS
+       * frame. Without it FrameParser leaves the signal fields at 0 (the
+       * drvinfo space is reserved on every frame but written only where the
+       * bit is set), and folding those zeros would drag the running averages
+       * — the CFO tracker in particular, whose enable threshold a diluted
+       * average never crosses. */
+      if (!p.RxAtrib.crc_err && p.RxAtrib.physt) {
         _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
         _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,
                      _eepromManager->numTotalRfPath);
@@ -1560,6 +1983,17 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
 }
 
 void RtlJaguarDevice::SetMonitorChannel(SelectedChannel channel) {
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
+  /* Scoped to the note, NOT held across the tune. Holding it deadlocks: when
+   * the fast path declines, the fallback calls SetMonitorChannel(), which
+   * takes this same non-recursive mutex again. With no register lock spanning
+   * the tune on this family, the note is taken on BOTH sides of it (below),
+   * so an arm that lands in between is still spoiled. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
   /* Keep the device-level channel state current: send_packet's 5GHz
    * CCK->OFDM clamp keys off _channel.Channel. Before this assignment
    * existed, _channel was never written anywhere — the clamp read an
@@ -1573,6 +2007,14 @@ void RtlJaguarDevice::SetMonitorChannel(SelectedChannel channel) {
    * all-paths behaviour is byte-identical when the knob is unused. */
   if (_rx_path_mask >= 0)
     _device.rtw_write8(0x808, static_cast<uint8_t>(_rx_path_mask.load()));
+  /* And after: with no register lock spanning the tune, an arm that landed
+   * between the note above and the channel change would otherwise read back
+   * a valid two-channel blend. send_packet's radiotap CHANNEL hop reaches
+   * FastRetune from the TX thread, so that arm is not hypothetical. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
 }
 
 void RtlJaguarDevice::SetRxPathMask(uint8_t mask) {
@@ -1585,8 +2027,23 @@ int RtlJaguarDevice::GetRxPathMask() {
 }
 
 void RtlJaguarDevice::FastRetune(uint8_t channel, bool cache_rf) {
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
+  /* Scoped to the note, NOT held across the tune. Holding it deadlocks: when
+   * the fast path declines, the fallback calls SetMonitorChannel(), which
+   * takes this same non-recursive mutex again. With no register lock spanning
+   * the tune on this family, the note is taken on BOTH sides of it (below),
+   * so an arm that lands in between is still spoiled. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
   if (_radioManagement->fast_retune(channel, cache_rf)) {
     _channel.Channel = channel;
+    /* And after — see SetMonitorChannel. The declined path lands in
+     * SetMonitorChannel, which notes on both sides itself. */
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
     return;
   }
   /* Fast path declined (band change / non-20MHz) — do the full channel set,
@@ -1597,8 +2054,24 @@ void RtlJaguarDevice::FastRetune(uint8_t channel, bool cache_rf) {
 }
 
 void RtlJaguarDevice::FastSetBandwidth(ChannelWidth_t bw) {
+  /* A bandwidth change re-clocks the front end, so a window armed before it
+   * was measuring a different receiver — the same argument as a retune.
+   *
+   * ONE rule, two shapes: the note must not be separable from the change by a
+   * concurrent arm. Where the family has a register lock that spans the
+   * change (Jaguar2/3), the note sits inside it and with_ccx's ordering does
+   * the rest. Here there is no such lock, and holding this one across the
+   * change would deadlock — the declined fast path falls back to
+   * SetMonitorChannel(), which takes it again — so the note is scoped and
+   * taken on both sides of the change instead. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
   if (_radioManagement->fast_set_bandwidth(bw)) {
     _channel.ChannelWidth = bw;
+    std::lock_guard<std::mutex> ccx(busy_window_mutex()); /* and after */
+    busy_window_note_retune();
     return;
   }
   /* Fast path declined (40/80 MHz endpoint, non-8812 die, or no clean 20 MHz
@@ -1786,6 +2259,15 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
   c.tx_chains = chains;
   c.rx_chains = chains;
   c.per_chain_rssi = chains >= 2;
+  /* CCX CLM via NhmReader's 11AC map, measured on this family
+   * (RTL8812AU, RTL8821AU; docs/rx-spectrum-sensing.md): a 240 ms armed window read
+   * 70.6-70.9% against a flooder that a MediaTek adapter independently
+   * measured, 0.1-1.0% quiet, and it behaves like the Jaguar2 in every
+   * window arm — period-bounded, latched, spoiled by an NHM read as a 4-point
+   * overcount rather than the JGR3 map's truncation. */
+  c.busy_airtime_ok = true;
+  c.busy_airtime_measured = true;
+  c.rx_energy_ok = true;
   c.bw_mask = devourer::bw_mask_for_generation(c.generation);
   /* 5/10 MHz narrowband on the 8812 die (8812AU/8811AU) and the 8814AU. Both
    * share the Jaguar2 0x8ac baseband clock-divider block; the codes are
@@ -1809,6 +2291,10 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
    * the vendor retry carve-out (knob inert). */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = _eepromManager->version_id.ICType != CHIP_8814A;
+  /* station_mode_ok: false on every Jaguar1 die - ported (StationArm.h),
+   * not yet measured by tests/realtek_station_onair.sh; the AdapterCaps
+   * declaration says what is and is not measured. */
+  c.station_mode_ok = false;
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
    * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air
@@ -1825,6 +2311,7 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into
                               * beacons (bench: 8821AU + 8814AU body-TS steps
                               * live at the beacon interval) */
+  c.tsf_write_ok = true; /* WriteTsf: bare REG_TSFTR (8821AU readback) */
   c.xtal_cap_max = 0x3f; /* 6-bit AFE crystal-cap trim (0x2C) */
   c.xtal_cap_default = _eepromManager->crystal_cap & 0x3f;
   devourer::set_standard_freq_ranges(c);
@@ -1956,7 +2443,7 @@ bool RtlJaguarDevice::NetDevOpen(SelectedChannel selectedChannel) {
   return true;
 }
 
-/* Clean shutdown — see IRtlDevice::Stop. Quiesce TX first so the de-init writes
+/* Clean shutdown — see IRadio::Stop. Quiesce TX first so the de-init writes
  * are not racing frames the transport still owns, then power the chip down.
  *
  * The power-down is the point: without it a Jaguar1 chip stays in ACT with its
@@ -1974,7 +2461,38 @@ bool RtlJaguarDevice::NetDevOpen(SelectedChannel selectedChannel) {
  * Best-effort: a chip that already dropped off the bus makes the writes fail,
  * which is fine on a teardown path. */
 void RtlJaguarDevice::Stop() {
+  /* The armed window dies with the session. Nothing else forgets it: this
+   * generation's with_ccx gates on _brought_up, which Stop() does not clear,
+   * so a window armed before a Stop stays visible afterwards and the next
+   * retune's note hands the caller a spoil reason earned by a session that no
+   * longer exists. Measured on an RTL8812AU with this reset removed: an
+   * arm/Stop/retune/read sequence reports spoil=retuned; with it, none.
+   * Scoped; nothing below takes the CCX lock. This generation has no
+   * FAMILY-WIDE register lock to order against (it has _port0_mu, a
+   * narrower one over the port0/TSF block, which is never taken under the
+   * CCX lock).
+   *
+   * What this does NOT close: no lock spans this Stop(), so a concurrent
+   * ArmChannelBusy can still land after the reset and during teardown, and
+   * with_ccx gates on _brought_up, which nothing here clears — so an arm
+   * issued AFTER a Stop still succeeds against a torn-down chip.
+   * ArmChannelBusy is single-control-thread by contract (IRadio.h); closing
+   * the rest means clearing _brought_up, which gates other paths. The
+   * contract and this residual are both at IRadio::ArmChannelBusy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _device.quiesce_tx();
+  /* A station arm ends with the session: restored before the optional
+   * power-down (best effort; a failure is logged by the clear), so a chip
+   * left powered (tuning.teardown_power_down=0) does not keep answering for
+   * the station. */
+  {
+    std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    if (_station.armed())
+      (void)_station.clear(_device, _logger, "Jaguar1");
+  }
   if (!_cfg.tuning.teardown_power_down) {
     _logger->info("Jaguar1: Stop() leaving the chip powered "
                   "(tuning.teardown_power_down=0)");
@@ -2007,6 +2525,14 @@ RtlJaguarDevice::~RtlJaguarDevice() {
   _rxmask_stop.store(true);
   if (_rxmask_thread.joinable()) {
     _rxmask_thread.join();
+  }
+  /* Safety net: a station arm the caller did not clear ends with the
+   * device, not with whatever state the chip is left in. */
+  try {
+    std::lock_guard<std::recursive_mutex> lk(_port0_mu);
+    if (_station.armed())
+      (void)_station.clear(_device, _logger, "Jaguar1");
+  } catch (...) {
   }
   /* Backstop for a caller that destroys without Stop(): power the chip down so
    * it is not left in ACT indefinitely. After the thread joins, so nothing is

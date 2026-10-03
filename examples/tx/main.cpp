@@ -48,6 +48,7 @@
 #include "SweepSpec.h"
 #include "TxPower.h" /* txpkt_pwr_db_for_step — DEVOURER_TX_PKT_OFSET fan-out */
 #include "caps_event.h"
+#include "station_arm_env.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
 #endif
@@ -64,6 +65,7 @@
 #include "PcieTransport.h"
 #endif
 #include "WiFiDriver.h"
+#include "IRtlRadio.h"
 #include "env_config.h"
 #include "RadiotapBuilder.h"
 #include "logger.h"
@@ -147,7 +149,7 @@ static std::mutex g_hopset_mu;
 static std::optional<devourer::hopset::HopsetKeys> g_hopset_keys;
 static std::optional<devourer::hopset::HopsetAuthority> g_hopset_auth;
 static std::optional<devourer::hopset::AdaptiveScheduleView> g_hopset_view;
-static IRtlDevice *g_hopset_dev = nullptr;
+static IRadio *g_hopset_dev = nullptr;
 static std::atomic<uint64_t> g_hopset_tick_slot{0};
 /* Quiet-window sensing (DEVOURER_TX_SENSE=1) and the fusion layer that decides
  * whether this side's own evidence may act on the schedule. */
@@ -221,7 +223,7 @@ static void hopset_route(
  *
  * window_us is measured, not nominal — the hardware keeps counting during the
  * read's own bus round-trips, so excluding that time would inflate the rate. */
-static bool hopset_sense_window(IRtlDevice *dev, uint32_t settle_us,
+static bool hopset_sense_window(IRtlRadio *dev, uint32_t settle_us,
                                 uint32_t window_us, bool with_nhm,
                                 devourer::hopset::SensePhase phase,
                                 uint64_t slot, uint64_t round,
@@ -287,10 +289,13 @@ static bool hopset_sense_window(IRtlDevice *dev, uint32_t settle_us,
     x.valid_nhm = total > 0;
     x.nhm_busy_pct =
         total ? static_cast<uint8_t>(100u * (total - e.nhm[0]) / total) : 0;
+    x.nhm_env_pct = e.nhm_env_ratio_pct;
     x.nhm_duration = e.nhm_duration;
   } else {
     x.flags |= devourer::hopset::kTsNhmMissing;
   }
+  x.valid_clm = e.valid_clm;
+  x.clm_ratio_pct = e.clm_ratio_pct;
   if (!e.valid_fa && !e.valid_igi && !x.valid_nhm)
     x.flags |= devourer::hopset::kTsReadFailed;
 
@@ -307,7 +312,9 @@ static bool hopset_sense_window(IRtlDevice *dev, uint32_t settle_us,
   return true;
 }
 
-static int g_rx_count = 0;
+/* Atomic: the station arm reads it from the main thread as proof the RX loop
+ * is running. */
+static std::atomic<int> g_rx_count{0};
 /* Windowed RX receipts (src/cell/RxReceipt.h): DEVOURER_TX_RECEIPTS=1 arms
  * the transmitter-side ledger. Receipts name our TA — DEVOURER_TX_SA when
  * set, else the canonical SA — and anything else refuses to absorb. */
@@ -321,7 +328,7 @@ static void packetProcessor(const Packet &packet) {
    * Jaguar3), not 802.11 frames — skip before counting/parsing. */
   if (packet.RxAtrib.pkt_rpt_type == RX_PACKET_TYPE::C2H_PACKET)
     return;
-  ++g_rx_count;
+  const int rx_n = ++g_rx_count;
   /* Windowed RX receipts (DEVOURER_TX_RECEIPTS=1, needs TX_WITH_RX=thread):
    * a plain data frame whose body parses as a receipt TLV naming OUR TA is
    * the receiver's delivered-set update (src/cell/RxReceipt.h). Every
@@ -348,9 +355,9 @@ static void packetProcessor(const Packet &packet) {
   }
   /* RX liveness marker for the TX+RX=thread mode: first frame + every 500th.
    * Without it a deaf RX loop is indistinguishable from a quiet channel. */
-  if (g_rx_count == 1 || g_rx_count % 500 == 0) {
+  if (rx_n == 1 || rx_n % 500 == 0) {
     devourer::Ev(*g_ev, "rx.count")
-        .f("total", g_rx_count)
+        .f("total", rx_n)
         .f("len", packet.Data.size());
   }
   /* BF self-sounding report detector (DEVOURER_BF_DETECT_REPORT modes 1-4,
@@ -368,7 +375,7 @@ static void packetProcessor(const Packet &packet) {
       /* rx.txhit fields are parsed by tests/regress.py — keep names stable. */
       devourer::Ev(*g_ev, "rx.txhit")
           .f("hits", hits)
-          .f("total_rx", g_rx_count)
+          .f("total_rx", rx_n)
           .f("len", packet.Data.size());
     }
   }
@@ -689,6 +696,22 @@ int main(int argc, char **argv) {
    * nothing reaches the air" (issue #36). This thread polls EP 0x85 until
    * the process is killed; failures other than -ETIMEDOUT are logged once
    * per N. */
+  /* DEVOURER_STA_IDENTITY (examples/common/station_arm_env.h). Here it needs
+   * DEVOURER_TX_WITH_RX=thread: IRadio orders the arm after the RX loop, and
+   * a station that cannot hear its ACKs is not one. Checked before any
+   * thread below is started, so a refusal returns with nothing to join. */
+  bool sta_bad = false;
+  const auto sta_req = devourer::station_arm_request_from_env(logger, sta_bad);
+  if (sta_bad)
+    return 1;
+  if (sta_req) {
+    const char *twr = std::getenv("DEVOURER_TX_WITH_RX");
+    if (twr == nullptr || std::string(twr) != "thread") {
+      logger->error("DEVOURER_STA_IDENTITY needs DEVOURER_TX_WITH_RX=thread "
+                    "on txdemo");
+      return 1;
+    }
+  }
   /* Optional bulk-IN drainer on EP 0x81 — gated by DEVOURER_DRAIN_BULK_IN=1.
    * The kernel `88XXau` driver pre-arms 8 bulk-IN URBs of 32 KB each on
    * EP 0x81 at the end of init, *before* the first TX. The RTL8814AU
@@ -764,7 +787,7 @@ int main(int argc, char **argv) {
   }
 
   WiFiDriver wifi_driver{logger};
-  std::unique_ptr<IRtlDevice> owned_device;
+  std::unique_ptr<IRadio> owned_device;
 #if defined(DEVOURER_HAVE_PCIE)
   if (pcie_bdf) {
     auto transport = devourer::PcieTransport::Open(pcie_bdf, logger);
@@ -773,7 +796,7 @@ int main(int argc, char **argv) {
     devourer::Ev(*g_ev, "init.timing")
         .f("stage", "txdemo.open_device")
         .f("ms", ms_since_start());
-    owned_device = wifi_driver.CreateRtlDevicePcie(std::move(transport),
+    owned_device = wifi_driver.CreateRadioPcie(std::move(transport),
                                                    devourer_config_from_env());
   } else
 #endif
@@ -782,7 +805,7 @@ int main(int argc, char **argv) {
       logger->error("DEVOURER_PCIE_BDF set but this build has DEVOURER_PCIE=OFF");
       return 1;
     }
-    owned_device = wifi_driver.CreateRtlDevice(handle, nullptr, usb_lock,
+    owned_device = wifi_driver.CreateRadio(handle, nullptr, usb_lock,
                                                devourer_config_from_env());
   }
   if (!owned_device) {
@@ -794,7 +817,7 @@ int main(int argc, char **argv) {
   /* The session owns the device from here: it is what guarantees the device
    * (and its in-flight TX) dies before libusb does. */
   session.adopt_device(std::move(owned_device));
-  IRtlDevice *const rtlDevice = session.device();
+  IRadio *const rtlDevice = session.device();
   devourer::Ev(*g_ev, "init.timing")
       .f("stage", "txdemo.create_device")
       .f("ms", ms_since_start());
@@ -802,7 +825,7 @@ int main(int argc, char **argv) {
 
   /* Jaguar1-only research features (TX-mode default, fast-retune hopping,
    * thermal telemetry, TXAGC override, BB-reg probe) are not part of the
-   * IRtlDevice contract — reach them by downcasting. jag is null on Jaguar3,
+   * IRadio contract — reach them by downcasting. jag is null on Jaguar3,
    * where those call sites are skipped, and compiled out entirely when Jaguar1
    * support isn't built. */
 #if defined(DEVOURER_HAVE_JAGUAR1)
@@ -816,6 +839,10 @@ int main(int argc, char **argv) {
 #if defined(DEVOURER_HAVE_JAGUAR3)
   RtlJaguar3Device *jag3 = dynamic_cast<RtlJaguar3Device *>(rtlDevice);
 #endif
+  /* Realtek-only members (frame-free energy counters, the crystal-cap trim).
+   * Null on a non-Realtek radio; every feature that needs it says so and
+   * skips rather than reporting a fictional measurement. */
+  IRtlRadio *const rtlRadio = dynamic_cast<IRtlRadio *>(rtlDevice);
 
   int channel = 161;
   if (const char *ch_env = std::getenv("DEVOURER_CHANNEL")) {
@@ -1031,8 +1058,11 @@ int main(int argc, char **argv) {
    * StartRxLoop assumes the chip is up and takes over bulk-IN; send_packet's
    * bulk-OUT is safe alongside it. packetProcessor runs on this thread. */
   std::thread rx_thread;
+  /* Set once StartRxLoop has returned or thrown - the RX loop is gone. The
+   * station arm below refuses on it. */
+  std::atomic<bool> rx_ended{false};
   if (rx_thread_mode) {
-    rx_thread = std::thread([&rtlDevice, logger] {
+    rx_thread = std::thread([&rtlDevice, &rx_ended, logger] {
       /* An uncaught exception in a std::thread is std::terminate — a transient
        * USB read failure in the RX loop must not tear down the TX process. */
       try {
@@ -1040,8 +1070,45 @@ int main(int argc, char **argv) {
       } catch (const std::exception &e) {
         logger->error("RX loop died: {} (TX continues)", e.what());
       }
+      rx_ended = true;
     });
     logger->info("DEVOURER_TX_WITH_RX=thread: RX loop started alongside TX");
+  }
+
+  /* DEVOURER_STA_IDENTITY: arm before the first frame, once the RX loop is
+   * shown running - its first received frame (3 s cap: a silent channel still
+   * arms) - and refuse if it has failed or ended (rx_ended). A refused arm
+   * sends nothing and exits 1 - frames from an unarmed station must not be
+   * scored as a station's. */
+  std::atomic<bool> sta_stop{false};
+  std::thread sta_clear_thread;
+  /* Joins the scheduled clear on every exit path, the early returns below
+   * included - a joinable std::thread destructor terminates the process. */
+  struct StaClearJoin {
+    std::atomic<bool> &stop;
+    std::thread &t;
+    ~StaClearJoin() {
+      stop = true;
+      if (t.joinable())
+        t.join();
+    }
+  } sta_clear_join{sta_stop, sta_clear_thread};
+  bool sta_failed = false;
+  if (sta_req) {
+    for (int s = 0; s < 3000 && !rx_ended.load() && !g_devourer_should_stop &&
+                    g_rx_count.load() == 0;
+         s += 50)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!devourer::station_arm_run(rtlDevice, *sta_req, *g_ev, logger,
+                                   sta_stop, &rx_ended)) {
+      sta_failed = true;
+      g_devourer_should_stop = true;
+    } else if (sta_req->clear_after_ms > 0) {
+      const devourer::StationArmRequest req = *sta_req;
+      sta_clear_thread = std::thread([&sta_stop, rtlDevice, req, logger]() {
+        devourer::station_clear_after(rtlDevice, req, *g_ev, logger, sta_stop);
+      });
+    }
   }
 
   uint8_t beacon_frame[] = {
@@ -1068,7 +1135,7 @@ int main(int argc, char **argv) {
    * default apply; a frame embedding its own rate radiotap overrides it per
    * packet. Default (no env) = 6 M legacy. Replaces the former per-knob
    * DEVOURER_TX_MCS/_VHT/_LDPC/_STBC/_BW env vars + the DEVOURER_TX_HT_MCS gate. */
-  /* TX-mode default (DEVOURER_TX_RATE) — now a first-class IRtlDevice feature so
+  /* TX-mode default (DEVOURER_TX_RATE) — now a first-class IRadio feature so
    * it applies to Jaguar3 (8822CU/EU) too. The demo's beacon is rate-less, so
    * without this its Jaguar3 TX fell back to MGN_1M (1 Mbps) regardless of
    * DEVOURER_TX_RATE. Per-packet radiotap still overrides. */
@@ -1372,6 +1439,36 @@ int main(int argc, char **argv) {
     if (tx_threads > 1)
       logger->info("DEVOURER_TX_THREADS — {} parallel senders", tx_threads);
   }
+  /* DEVOURER_TX_ALT_RATE=<rate spec> — every ODD-counter frame carries its own
+   * rate radiotap built from this spec (the DEVOURER_TX_RATE grammar, /NOAGG
+   * included); even frames keep the rate-less default. Needs
+   * DEVOURER_TX_QOS_DATA: the receiver tells the two apart by the stamped
+   * counter's parity (rx.seq pctr). The A-MPDU mixed-rate harness
+   * (tests/tx_no_agg_onair.sh). Replaces the frame each send, so it does not
+   * combine with the hop markers or DEVOURER_TX_STBC_TOGGLE. */
+  std::vector<uint8_t> tx_base_buf, tx_alt_buf;
+  if (const char *e = std::getenv("DEVOURER_TX_ALT_RATE")) {
+    if (!qos_stamp) {
+      logger->warn("DEVOURER_TX_ALT_RATE needs DEVOURER_TX_QOS_DATA — ignored");
+    } else {
+      const size_t rl = tx_buf[2] | (tx_buf[3] << 8);
+      tx_base_buf = tx_buf;
+      /* NOACK like the base frame's rate-less radiotap. */
+      tx_alt_buf =
+          devourer::build_stream_radiotap(devourer::parse_tx_mode_str(e));
+      tx_alt_buf.insert(tx_alt_buf.end(), tx_buf.begin() + rl, tx_buf.end());
+      logger->info("DEVOURER_TX_ALT_RATE={} — odd-counter frames", e);
+    }
+  }
+  /* Stamp the QoS per-frame counter at MPDU bytes 26..29 (after the frame's
+   * own radiotap), picking the ALT_RATE variant by parity first. */
+  auto stamp_counter = [&](std::vector<uint8_t> &b, uint32_t v) {
+    if (!tx_alt_buf.empty())
+      b = (v & 1) ? tx_alt_buf : tx_base_buf;
+    const size_t rl = b.size() >= 4 ? (b[2] | (b[3] << 8)) : b.size();
+    if (qos_stamp && b.size() >= rl + 26 + 4)
+      std::memcpy(b.data() + rl + 26, &v, 4);
+  };
   std::atomic<long> tx_counter{0}; /* shared frame-stamp source (threads>1) */
   std::vector<std::thread> tx_aux;
 
@@ -1660,6 +1757,11 @@ int main(int argc, char **argv) {
        * contain an unknown number of our own frames and read as interference.
        * A silently wrong measurement feeding an exclusion is worse than no
        * measurement, so refuse rather than half-gate. */
+      if (!rtlRadio) {
+        logger->error("DEVOURER_TX_SENSE needs a Realtek radio (IRtlRadio "
+                      "frame-free counters) — sensing not armed");
+        tx_sense = false;
+      }
       if (tx_threads > 1) {
         logger->error("DEVOURER_TX_SENSE is incompatible with "
                       "DEVOURER_TX_THREADS>1 — sensing not armed");
@@ -1772,13 +1874,16 @@ int main(int argc, char **argv) {
         int dwell = 4000;
         if (const char *ms = std::getenv("DEVOURER_XTAL_STEP_MS"))
           dwell = std::atoi(ms);
+        if (!rtlRadio)
+          logger->warn("DEVOURER_XTAL_STEP is Realtek-only (IRtlRadio) — "
+                       "steps are logged with cap=-1 on this radio");
         std::string s(steps);
         size_t pos = 0;
         while (!g_devourer_should_stop && pos < s.size()) {
           size_t comma = s.find(',', pos);
           int cap = std::strtol(s.substr(pos, comma - pos).c_str(), nullptr, 0);
           pos = (comma == std::string::npos) ? s.size() : comma + 1;
-          int applied = rtlDevice->SetXtalCap(cap);
+          int applied = rtlRadio ? rtlRadio->SetXtalCap(cap) : -1;
           devourer::Ev(*g_ev, "xtal.step").f("cap", applied);
           logger->info("xtal.step cap=0x{:02x}", applied);
           for (int t = 0; t < dwell && !g_devourer_should_stop; t += 100)
@@ -1813,6 +1918,134 @@ int main(int argc, char **argv) {
                  "idling until SIGINT (Ctrl-C to stop)");
     while (!g_devourer_should_stop)
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  /* DEVOURER_TX_BEACON_TU=N (demo-local; unset or 0 = off): arm the hardware
+   * TBTT beacon (IRadio::StartBeacon) at an N-TU interval before the injection
+   * loop, then inject exactly as without it. This is the in-tree reproducer
+   * for the Jaguar2/3 TX page-ring defect (docs/jaguar3-tx-ring.md): the data
+   * ring only overwrites the beacon page when a beacon is armed, so plain
+   * injection never shows it. It reproduces with data-sized frames and the RX
+   * loop running - DEVOURER_TX_QOS_DATA=1 DEVOURER_TX_PAYLOAD_BYTES=1400
+   * DEVOURER_TX_WITH_RX=thread plus DEVOURER_TX_FRAMES=8000
+   * DEVOURER_TX_GAP_US=0 (the canonical 100-byte frame alone did not, on an
+   * 8812CU); the verdict is `failed` / was_timeout in tx.stats, and
+   * txdma_status where a sample catches it. SA/BSSID = the canonical SA, so
+   * rx.txhit witnesses match the beacon too. A refused StartBeacon warns and
+   * the run continues unbeaconed.
+   *
+   * The beacon is a plain 802.11 MPDU, no radiotap: the IRadio contract says
+   * a leading radiotap is stripped, but only the Jaguar1/2/3 and MT7612U
+   * backends do; Kestrel hands its buffer to the firmware as-is. A bare MPDU
+   * with a zero Duration field is what every backend accepts - the Jaguar
+   * backends read bytes [2:3] as a radiotap length, which is 0 here. Only
+   * Jaguar2/3 are armed at all (below).
+   *
+   * The chip beacons AUTONOMOUSLY once armed, so the stop is a scope guard,
+   * not a teardown line: `attempted` is set BEFORE StartBeacon (a call that
+   * throws or refuses may still have armed part of it), and the guard stops
+   * the beacon on every exit from here - the normal teardown calls stop()
+   * explicitly, before Stop() powers the chip down; the destructor covers an
+   * exception or an early return. It is declared after the DeviceSession, so
+   * it runs before the device is destroyed. `attempted` is cleared only by a
+   * StopBeacon that returned (true, or a clean false = nothing active, per
+   * its contract); after three throws it stays set, so a later stop() - the
+   * destructor on an exception path - tries again. detach() drops the device
+   * before the normal path destroys it. */
+  struct TxBeaconGuard {
+    IRadio *dev;
+    std::shared_ptr<Logger> log;
+    bool attempted = false;
+    bool armed = false;
+    void stop() {
+      if (!attempted || dev == nullptr)
+        return;
+      for (int i = 0; i < 3; i++) {
+        try {
+          /* true = stopped; a clean false = nothing active (StopBeacon
+           * contract), expected after a refused StartBeacon - either way
+           * there is nothing to retry. */
+          dev->StopBeacon();
+          attempted = false;
+          return;
+        } catch (const std::exception &e) {
+          log->warn("DEVOURER_TX_BEACON_TU: StopBeacon threw: {}", e.what());
+        }
+      }
+      /* Three throws: `attempted` stays set so a later stop() tries again. */
+      log->error("DEVOURER_TX_BEACON_TU: StopBeacon failed 3 times - the "
+                 "beacon may keep airing until the adapter is re-enumerated "
+                 "or powered down (Jaguar2 has no teardown power-down)");
+    }
+    /* The device is about to be destroyed: stop calling into it. */
+    void detach() { dev = nullptr; }
+    ~TxBeaconGuard() {
+      try {
+        stop();
+      } catch (...) {
+      }
+    }
+  } tx_beacon{rtlDevice, logger};
+  /* Not after a CW/continuous hold: those return only on shutdown. */
+  if (const char *btu = std::getenv("DEVOURER_TX_BEACON_TU");
+      btu && !g_devourer_should_stop) {
+    char *btu_end = nullptr;
+    const long tu = std::strtol(btu, &btu_end, 0);
+    const bool btu_ok = btu_end != btu && *btu_end == '\0';
+    /* Armed on Jaguar2 and Jaguar3 only: the dies with the page-ring defect
+     * this knob reproduces, and the ones whose StartBeacon is all-or-nothing
+     * (a true return means armed; a failed arm rolls back) and whose
+     * StopBeacon disarms it. Jaguar1's StartBeacon returns true even when
+     * its closing PinBeaconTbtt(0) re-download fails, so the arm cannot be
+     * confirmed there (pre-existing); Kestrel has no StopBeacon override at
+     * all (pre-existing). Everything else warns and runs unbeaconed. */
+    const devourer::ChipGeneration bgen =
+        rtlDevice->GetAdapterCaps().generation;
+    const bool bgen_ok = bgen == devourer::ChipGeneration::Jaguar2 ||
+                         bgen == devourer::ChipGeneration::Jaguar3;
+    if (!btu_ok) {
+      logger->warn("DEVOURER_TX_BEACON_TU='{}' is not a number - no beacon",
+                   btu);
+    } else if (tu != 0 && bgen == devourer::ChipGeneration::Jaguar1) {
+      logger->warn("DEVOURER_TX_BEACON_TU: not armed: the reproducer targets "
+                   "Jaguar2/3, and Jaguar1's StartBeacon cannot confirm the "
+                   "arm (it ignores its PinBeaconTbtt(0) re-download result)");
+    } else if (tu != 0 && !bgen_ok) {
+      logger->warn("DEVOURER_TX_BEACON_TU: not armed: the reproducer targets "
+                   "Jaguar2/3 ({})",
+                   devourer::generation_name(bgen));
+    } else if (tu > 0 && tu <= 0xFFFF) {
+      const bool five_g = tx_band == 6 || channel > 14;
+      const uint8_t rate = five_g ? 0x8c /* 6M basic */ : 0x82 /* 1M basic */;
+      const uint8_t bcn[] = {
+          0x80, 0x00, 0x00, 0x00,                         // FC beacon + dur 0
+          0xff, 0xff, 0xff, 0xff, 0xff, 0xff,             // addr1 broadcast
+          0x57, 0x42, 0x75, 0x05, 0xd6, 0x00,             // addr2 = canonical SA
+          0x57, 0x42, 0x75, 0x05, 0xd6, 0x00,             // addr3 = BSSID
+          0x00, 0x00,                                     // seq
+          0, 0, 0, 0, 0, 0, 0, 0,                         // timestamp (HW fills)
+          static_cast<uint8_t>(tu & 0xff),
+          static_cast<uint8_t>((tu >> 8) & 0xff),         // beacon interval
+          0x00, 0x00,                                     // capability
+          0x00, 15, 'd', 'e', 'v', 'o', 'u', 'r', 'e', 'r', '-', 't', 'x', 'r',
+          'i', 'n', 'g',                                  // SSID "devourer-txring"
+          0x01, 0x01, rate};                              // supported rates
+      tx_beacon.attempted = true; /* before the call - see TxBeaconGuard */
+      try {
+        tx_beacon.armed =
+            rtlDevice->StartBeacon(bcn, sizeof(bcn), static_cast<int>(tu));
+      } catch (const std::exception &e) {
+        logger->warn("DEVOURER_TX_BEACON_TU: StartBeacon threw: {}", e.what());
+      }
+      if (tx_beacon.armed)
+        logger->info("DEVOURER_TX_BEACON_TU: hardware beacon armed, {} TU", tu);
+      else
+        logger->warn("DEVOURER_TX_BEACON_TU: StartBeacon refused - continuing "
+                     "without a beacon");
+    } else if (tu != 0) {
+      logger->warn("DEVOURER_TX_BEACON_TU={} is outside 1..65535 - no beacon",
+                   btu);
+    }
   }
 
   while (!g_devourer_should_stop) {
@@ -1993,7 +2226,7 @@ int main(int argc, char **argv) {
         mode = "radiotap";
       }
       else if (hop_fast) {
-        /* IRtlDevice virtual: every generation implements the lean fast path
+        /* IRadio virtual: every generation implements the lean fast path
          * (cached RF18 write + on-change constants, with the internal
          * band-change fallback to the full set). */
         rtlDevice->FastRetune(static_cast<uint8_t>(ch),
@@ -2053,7 +2286,7 @@ int main(int argc, char **argv) {
         if (committing) {
           sense_armed = false;
         } else {
-          hopset_sense_window(rtlDevice, tx_sense_settle_us,
+          hopset_sense_window(rtlRadio, tx_sense_settle_us,
                               tx_sense_window_us, tx_sense_nhm,
                               devourer::hopset::SensePhase::PreBurst,
                               desired_slot, round,
@@ -2086,7 +2319,7 @@ int main(int argc, char **argv) {
           gen = g_hopset_view->state().generation;
         }
         sense_post_done = true;
-        hopset_sense_window(rtlDevice, 0, tx_sense_post_us,
+        hopset_sense_window(rtlRadio, 0, tx_sense_post_us,
                             tx_sense_nhm,
                             devourer::hopset::SensePhase::PostBurst,
                             desired_slot, round,
@@ -2194,10 +2427,7 @@ int main(int argc, char **argv) {
     /* QoS spike frames carry a per-frame counter at body[0..3] (MPDU bytes
      * 26..29) so the receiver can count UNIQUE frames vs hardware re-airings
      * (the A-MPDU engine renumbers seqs per aggregate, so seq can't). */
-    if (qos_stamp && tx_buf.size() >= 10 + 26 + 4) {
-      uint32_t v = static_cast<uint32_t>(tx_count);
-      std::memcpy(tx_buf.data() + 10 + 26, &v, 4);
-    }
+    stamp_counter(tx_buf, static_cast<uint32_t>(tx_count));
     /* Lazy-start the auxiliary senders on the first main-loop pass (the
      * chip is up and the first frame primed by then). */
     if (tx_threads > 1 && tx_aux.empty()) {
@@ -2212,10 +2442,7 @@ int main(int argc, char **argv) {
                 tx_counter.fetch_add(static_cast<long>(bufs.size()));
             for (size_t k = 0; k < bufs.size(); ++k) {
               auto &b = bufs[k];
-              if (qos_stamp && b.size() >= 10 + 26 + 4) {
-                uint32_t v = static_cast<uint32_t>(base + (long)k);
-                std::memcpy(b.data() + 10 + 26, &v, 4);
-              }
+              stamp_counter(b, static_cast<uint32_t>(base + (long)k));
               views.push_back(TxPacketView{b.data(), b.size()});
             }
             rtlDevice->send_packets(views.data(), views.size());
@@ -2235,11 +2462,9 @@ int main(int argc, char **argv) {
       tx_batch_views.clear();
       for (long k = 0; k < tx_batch; ++k) {
         auto &b = tx_batch_bufs[static_cast<size_t>(k)];
-        if (qos_stamp && b.size() >= 10 + 26 + 4) {
-          uint32_t v = static_cast<uint32_t>(
-              tx_threads > 1 ? tx_counter.fetch_add(1) : tx_count + k);
-          std::memcpy(b.data() + 10 + 26, &v, 4);
-        }
+        stamp_counter(b, static_cast<uint32_t>(tx_threads > 1
+                                                   ? tx_counter.fetch_add(1)
+                                                   : tx_count + k));
         tx_batch_views.push_back(TxPacketView{b.data(), b.size()});
       }
       const size_t okn = rtlDevice->send_packets(tx_batch_views.data(),
@@ -2263,11 +2488,35 @@ int main(int argc, char **argv) {
        * climbing failed with was_timeout=1 is a full TX FIFO (recoverable
        * back-pressure); a hard rc is a broken path. */
       auto ts = rtlDevice->GetTxStats();
-      devourer::Ev(*g_ev, "tx.stats")
-          .f("submitted", (unsigned long long)ts.submitted)
+      /* The MAC's TX-DMA fault latch (IRtlRadio::GetTxDmaStatus), on the
+       * same 1-in-500 cadence as the rest of this event - never per frame.
+       * Emitted raw: not every set bit means stopped (which ones do:
+       * IRtlRadio::GetTxDmaStatus). */
+      /* A register read can throw under load (a control transfer racing the
+       * bulk-IN); that sample then omits the field and says so, rather than
+       * reporting a 0 that reads as healthy - or killing the demo. */
+      /* Only where the backend reads the real latch (HasTxDmaStatus): its 0
+       * default elsewhere would read as "healthy" for a chip never asked. */
+      uint32_t txdma = 0;
+      bool txdma_have = false, txdma_ok = true;
+      if (auto *rr = dynamic_cast<IRtlRadio *>(rtlDevice);
+          rr && rr->HasTxDmaStatus()) {
+        txdma_have = true;
+        try {
+          txdma = rr->GetTxDmaStatus();
+        } catch (const std::exception &) {
+          txdma_ok = false;
+        }
+      }
+      auto ev = devourer::Ev(*g_ev, "tx.stats");
+      ev.f("submitted", (unsigned long long)ts.submitted)
           .f("failed", (unsigned long long)ts.failed)
           .f("was_timeout", ts.last_was_timeout ? 1 : 0)
           .f("last_rc", ts.last_error_rc);
+      if (txdma_have && txdma_ok)
+        ev.f("txdma_status", (unsigned long long)txdma);
+      else if (txdma_have)
+        ev.f("txdma_read_failed", 1);
     }
     /* Thermal telemetry via the generation-agnostic GetThermalStatus
      * (previously Jaguar1-only): every family reads its RF 0x42 meter —
@@ -2355,7 +2604,8 @@ int main(int argc, char **argv) {
         .f("failed", (unsigned long long)ts.failed)
         .f("was_timeout", ts.last_was_timeout ? 1 : 0)
         .f("last_rc", ts.last_error_rc)
-        .f("final", 1);
+        .f("final", 1)
+        .t();
   }
 
   /* Shard accounting: what the producer handed us versus what the chip was
@@ -2399,8 +2649,16 @@ int main(int argc, char **argv) {
 #endif
   }
 
+  /* DEVOURER_TX_BEACON_TU: stop the beacon now, while the chip is still up
+   * (Stop() below powers it down; session.close() destroys the device before
+   * the guard's own destructor would run). Idempotent - see TxBeaconGuard. */
+  tx_beacon.stop();
+
   /* Join the RX loop BEFORE Stop(): the chip de-init must not race in-flight
    * RX URBs (and StartRxLoop's event pump must exit before libusb_exit). */
+  sta_stop = true;
+  if (sta_clear_thread.joinable())
+    sta_clear_thread.join();
   rtlDevice->StopRxLoop();
   if (rx_thread.joinable())
     rx_thread.join();
@@ -2415,8 +2673,12 @@ int main(int argc, char **argv) {
   /* Device, then interface, handle and context (DeviceSession.h). Explicit
    * only because the process has nothing left to do here — the destructor
    * does exactly the same on every other exit path. */
+  /* The beacon guard must not call into the device once it is gone. */
+  tx_beacon.detach();
   session.close();
   /* A truncated caller stream is a producer fault, and a harness that scored
    * the run as if it had ended cleanly would be scoring a short measurement. */
+  if (sta_failed)
+    return 1;
   return stdin_truncated ? 2 : 0;
 }

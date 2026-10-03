@@ -94,8 +94,11 @@ private:
   Logger_t _logger;
   ChipVariant _variant; /* selects the firmware blob (8822c vs 8822e) */
   devourer::FwBootStatus _boot; /* last download_firmware outcome */
-  /* halmac adapter->dlfw_pkt_size — the per-chunk DDMA size. */
-  uint32_t _dlfw_pkt_size = 4096;
+  /* Keep each USB reserved-page transfer at 1024 bytes including the 48-byte
+   * 8822C descriptor. Some RTL8822CU USB2 implementations accept exactly the
+   * first 1024 bytes of a 4144-byte transfer and then NAK until libusb times
+   * out. Smaller chunks are valid for the HalMAC DLFW/DDMA loop. */
+  uint32_t _dlfw_pkt_size = 976;
   /* halmac adapter->txff_alloc.rsvd_boundary — the reserved-page boundary the
    * rsvd-page bracket restores FIFOPAGE_CTRL_2 to. Computed by the queue/page
    * allocation during power-on. */

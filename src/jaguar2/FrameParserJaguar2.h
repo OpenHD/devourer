@@ -207,6 +207,11 @@ struct Rx8822bFrame {
   uint8_t shift;
   uint32_t tsfl;              /* hardware TSF-low at receive */
   bool paggr;                 /* MPDU arrived inside an A-MPDU */
+  bool physt;                 /* a PHY-status report was written for THIS frame;
+                               * REG_RX_DRVINFO_SZ is global, so the drvinfo
+                               * space is reserved on every frame and holds
+                               * stale bytes without this bit — notably on
+                               * all-but-one subframe of an A-MPDU */
   uint8_t ppdu_cnt;           /* 2-bit received-PPDU counter */
   uint32_t next_offset;
 };
@@ -227,6 +232,7 @@ inline bool parse_rx_8822b(const uint8_t *buf, size_t buflen,
   out.rx_rate = static_cast<uint8_t>(GET_RX_DESC_RX_RATE_8822B(buf));
   out.tsfl = static_cast<uint32_t>(GET_RX_DESC_TSFL_8822B(buf));
   out.paggr = GET_RX_DESC_PAGGR_8822B(buf) != 0;
+  out.physt = GET_RX_DESC_PHYST_8822B(buf) != 0;
   out.ppdu_cnt = static_cast<uint8_t>(GET_RX_DESC_PPDU_CNT_8822B(buf));
 
   uint32_t frame_off =
@@ -248,14 +254,22 @@ inline bool parse_rx_8822b(const uint8_t *buf, size_t buflen,
  * SNR rxsnr[i] and per-stream EVM rxevm[i] (both s(8,1), i.e. half-dB units, as
  * the vendor stores them). Values are the raw phy-status fields, matching the
  * Jaguar-1 FrameParser convention (rssi = per-path power byte, dBm = value-110).
- * CCK (type0) reports a single path-A pwdb. Requires physts_len >= 28. */
-inline void parse_phy_sts_jgr2(const uint8_t *physts, uint16_t physts_len,
-                               bool is_cck, rx_pkt_attrib &a) {
+ * CCK (type0) reports a single path-A pwdb. `configured_bw` is the card's
+ * currently tuned bandwidth (0/1/2 = 20/40/80 MHz, the `a.bw` encoding) — see
+ * the rxsc-to-bw comment below. Requires physts_len >= 28.
+ * Returns which fields of `a` were filled (PhyStsFill): None on a null/short
+ * buffer, Power for the CCK type0 report (path-A power only — EVM/SNR and the
+ * CFO tail are NOT in that layout and stay 0), Full for type1. Callers must
+ * not fold a field the return value does not claim. */
+inline PhyStsFill parse_phy_sts_jgr2(const uint8_t *physts, uint16_t physts_len,
+                                     bool is_cck, uint8_t configured_bw,
+                                     rx_pkt_attrib &a) {
   if (physts == nullptr || physts_len < 28)
-    return;
+    return PhyStsFill::None;
   if (is_cck) {
     /* type0: DW0 = page_num(0), pwdb(1), ... */
     a.rssi[0] = physts[1];
+    return PhyStsFill::Power;
   } else {
     /* type1: DW0/1 pwdb[4] at bytes 1..4; DW4 rxevm[4] at bytes 16..19;
      * DW5 cfo_tail[4] at bytes 20..23; DW6 rxsnr[4] at bytes 24..27. */
@@ -268,14 +282,21 @@ inline void parse_phy_sts_jgr2(const uint8_t *physts, uint16_t physts_len,
     /* DW1 byte7 flags: [5]=ldpc [6]=stbc [7]=beamformed (phy_sts_rpt_jgr2_type1).
      * DW1 byte5: l_rxsc[3:0] / ht_rxsc[7:4]; the vendor derives RX bandwidth from
      * the active rxsc (legacy OFDM uses l_rxsc, HT/VHT uses ht_rxsc): rxsc 1-8 =
-     * 20, 9-12 = 40, >=13 = 80 MHz (phydm_get_phy_sts_type1). */
+     * 20, 9-12 = 40, >=13 = 80 MHz (phydm_get_phy_sts_type1). rxsc 0 means the
+     * packet occupied the receiver's full configured bandwidth
+     * (phydm_rxsc_2_bw): an HT/VHT frame on a 40 MHz-tuned card reports 0 and
+     * would otherwise read as 20. Legacy OFDM stays 20 MHz whatever the
+     * tuning. */
     const uint8_t f7 = physts[7];
     a.ldpc = (f7 >> 5) & 1;
     a.stbc = (f7 >> 6) & 1;
     const uint8_t l_rxsc = physts[5] & 0x0f, ht_rxsc = (physts[5] >> 4) & 0x0f;
     const uint8_t rxsc = (a.data_rate >= 4 && a.data_rate <= 11) ? l_rxsc : ht_rxsc;
-    a.bw = rxsc >= 13 ? 2 : rxsc >= 9 ? 1 : 0;
+    a.bw = rxsc == 0 && a.data_rate >= 12
+               ? configured_bw
+               : rxsc >= 13 ? 2 : rxsc >= 9 ? 1 : 0;
   }
+  return PhyStsFill::Full;
 }
 
 } /* namespace jaguar2 */

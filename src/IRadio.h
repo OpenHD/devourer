@@ -1,5 +1,5 @@
-#ifndef IRTL_DEVICE_H
-#define IRTL_DEVICE_H
+#ifndef IRADIO_H
+#define IRADIO_H
 
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +11,6 @@
 #include "DeviceConfig.h"
 #include "AdapterHealth.h"
 #include "RxQuality.h"
-#include "RxSense.h"
 #include "SelectedChannel.h"
 #include "ThermalStatus.h"
 #include "Sounding.h"
@@ -35,20 +34,21 @@ struct TxPacketView {
   size_t len;
 };
 
-/* IRtlDevice is the chip-family-agnostic device contract used by the demos and
- * the WiFiDriver factory. The production family implementations are:
- *   - RtlJaguarDevice   — Realtek "Jaguar" wave-1 (8812AU/8811AU/8821AU/8814AU)
- *   - RtlJaguar2Device  — Realtek "Jaguar2" (8822BU/8812BU)
- *   - RtlJaguar3Device  — Realtek "Jaguar3" (8822CU/8812EU/8822EU)
- *   - Rtl8733bDevice    — Realtek HALMAC 87xx 11n (RTL8731BU/RTL8733BU)
- *   - RtlKestrelDevice  — Realtek G6 11ax (RTL8852BU/RTL8852CU)
+/* IRadio is the vendor-neutral radio contract used by the demos and the
+ * WiFiDriver factory (CreateRadio returns one). Optional members are virtual
+ * with not-ported defaults; the pure-virtual core is Init / InitWrite /
+ * StartRxLoop / SetMonitorChannel / send_packet / GetSelectedChannel /
+ * SetCcaMode.
  *
- * Chip-family-specific research helpers (BB-debug-port reads, the 8814 queue
- * poller, ...) are intentionally NOT part of this interface — callers that need
- * them dynamic_cast down to the concrete type. */
-class IRtlDevice {
+ * Realtek-specific members (phydm energy counters, EFUSE stability, the
+ * crystal-cap trim, the canary register dump) live on IRtlRadio
+ * (src/IRtlRadio.h), which every Realtek backend derives from; per-generation
+ * research helpers (BB-debug-port reads, the 8814 queue poller, ...) live on
+ * the concrete classes. Callers that need either level dynamic_cast down and
+ * treat nullptr as "not available on this radio". */
+class IRadio {
 public:
-  virtual ~IRtlDevice() = default;
+  virtual ~IRadio() = default;
 
   virtual void Init(Action_ParsedRadioPacket packetProcessor,
                     SelectedChannel channel) = 0;
@@ -60,7 +60,30 @@ public:
    * StopRxLoop() is called or the global stop flag is set; it is restartable
    * after it returns. This is the piece that lets one process bring up once
    * (InitWrite) and then run TX and RX concurrently on the same claimed handle
-   * — Init is the RX-only convenience wrapper (bring-up + StartRxLoop). */
+   * — Init is the RX-only convenience wrapper (bring-up + StartRxLoop).
+   *
+   * WHICH THREAD THE CALLBACK RUNS ON IS BACKEND- AND MODE-SPECIFIC. In the
+   * Realtek USB backends' default RxMode::Async ring it runs on the thread
+   * that drives libusb's event handling; under RxMode::SpscFat it runs on the
+   * ring's consumer thread; on the MT7612U it runs on the thread that called
+   * StartRxLoop while a C-layer thread pumps libusb. Keep to the lock rule
+   * below on every backend regardless: where the callback is not on the
+   * event thread the deadlock does not form, but a callback parked on the
+   * caller's lock still stalls the receive path behind it, and the mode is a
+   * configuration detail a caller should not have to track. In the Async
+   * case a synchronous USB transfer made from any other thread (every register
+   * read or write behind a control call - SetStationIdentity, the TX-power
+   * setters, SetMonitorChannel, ...) waits for that thread to come back out
+   * of it. So never make a device call while holding a lock the callback
+   * takes: the callback blocks on the lock, the call blocks on the callback,
+   * and neither returns. The mechanism is libusb's: a synchronous transfer
+   * completes only when some thread handles libusb events, and in the Async
+   * case the thread that handles them IS the RX thread - which is inside the
+   * callback, waiting for the caller's lock. How many transfers a call makes
+   * only changes how often it loses the race: a call that makes almost none
+   * hides the deadlock in testing rather than avoiding it. The same holds
+   * inside a backend: a callback path that takes a lock some other thread
+   * holds across USB I/O must try_lock rather than block. */
   virtual void StartRxLoop(Action_ParsedRadioPacket packetProcessor) = 0;
 
   /* Ask a running StartRxLoop to exit (sets a flag; the caller then joins
@@ -158,23 +181,6 @@ public:
    * any knob. Returns false when unsupported or the chip isn't brought up. */
   virtual bool ReApplyTxPower() { return false; }
 
-  /* Crystal (XTAL) load-capacitance trim — the CFO lever. Writes the AFE
-   * crystal-cap field (a per-chip register), pulling the chip's reference
-   * oscillator a few ppm to align a marginal TX/RX crystal pair; the payoff
-   * is narrowband at the edge of its CFO budget (5 MHz at 5 GHz). `cap` is a
-   * raw trim code in [0, GetAdapterCaps().xtal_cap_max]; cap < 0 reverts to
-   * the efuse/default value. Both physical caps (Xi/Xo) are set together.
-   * Returns the applied code, or -1 when unsupported. Sticky across channel
-   * changes (an AFE register, untouched by the RF retune). */
-  virtual int SetXtalCap(int cap) {
-    (void)cap;
-    return -1;
-  }
-
-  /* Current crystal-cap code (the last SetXtalCap value, or the efuse default
-   * at bring-up). -1 when unsupported. */
-  virtual int GetXtalCap() { return -1; }
-
   /* Snapshot of the knob state + representative effective indices (register
    * readback where the family's TXAGC block is readable). */
   virtual devourer::TxPowerState GetTxPowerState() { return {}; }
@@ -198,7 +204,7 @@ public:
    * feature flags (per-packet TX power, narrowband, fast retune, per-chain
    * RSSI). Resolved at construction — safe from any thread and callable BEFORE
    * Init/InitWrite (the demos emit it as the `adapter.caps` event right after
-   * CreateRtlDevice). Default returns supported=false. */
+   * CreateRadio). Default returns supported=false. */
   virtual devourer::AdapterCaps GetAdapterCaps() { return {}; }
 
   /* Best-effort live estimate of which RX chains are actually carrying signal
@@ -219,14 +225,102 @@ public:
    * monitor RX/injection continue unchanged. The reliable-unicast enabler:
    * a peer TXing to `mac` with normal ack-policy gets hardware
    * retransmissions until the ACK (its tx.report shows retries~0). `mac`
-   * must be unicast (I/G clear). Turning a passive monitor into an active
-   * transmitter is opt-in only — never a default. Returns false where
-   * unsupported. Clear = net_type back to No Link. */
+   * must be unicast (I/G clear). Retargeting hardware ACK behavior to a
+   * caller-supplied address is opt-in only. Some implementations, notably
+   * RTL8733B, may already respond for the initialization MAC. Returns false
+   * when unsupported or when arm/verification fails; false is not proof of
+   * passive state, so implementations log if rollback cannot be verified.
+   * Clear is a non-throwing best effort to return net_type to No Link — and,
+   * where clearing net_type does not end the measured response behavior, to
+   * move the port identity off `mac` as well (see the RTL8733B and
+   * Jaguar1/CHIP_8812 backends). Clear does not promise silence: a die that
+   * matches MACID alone answers for whatever address is left programmed,
+   * including the one MAC bring-up wrote. */
   virtual bool SetAckResponder(const devourer::MacAddr &mac) {
     (void)mac;
     return false;
   }
   virtual void ClearAckResponder() {}
+
+  /* --- 802.11 infrastructure station (client) identity ---------------------
+   *
+   * Program the MAC for the STATION half of an infrastructure BSS: this
+   * adapter is `own`, the AP it has joined is `bssid`. Arms whatever the
+   * silicon needs to receive that BSS's traffic addressed to `own` and to
+   * auto-ACK it. `ClearStationIdentity` returns to the pre-arm state.
+   *
+   * WHY THIS IS NOT SetAckResponder(bssid). The two look interchangeable and
+   * are not, at least on MT7612U, where the auto-response engine matches
+   * address 1 against the port identity register. Arming an ACK responder
+   * there *retargets* that register, so `SetAckResponder(bssid)` on a station
+   * would move the port identity to the AP's address and break ACK for the
+   * station's own traffic - the exact opposite of what a station needs. A
+   * station's port identity is its OWN address, which is where MAC bring-up
+   * already leaves it, so a correct implementation on that part must write
+   * the BSSID somewhere else and leave the port identity alone. Backends
+   * where one register genuinely serves both may implement this in terms of
+   * the other; they must not assume it.
+   *
+   * ORDERING. Call after the RX loop is running, not before. This is not a
+   * style preference: a backend may program the receive filter when the RX
+   * loop starts and overwrite anything an earlier call wrote (MT7612U does
+   * exactly this - see Mt7612uRadio::StartRxLoop). An implementation that
+   * cannot detect being called too early must say so at its declaration;
+   * one that can should refuse and log rather than arm something that will
+   * be silently undone.
+   *
+   * `own` and `bssid` must both be unicast (I/G clear) and must differ.
+   * Returns false when unsupported, when the arguments are refused, or when
+   * the arm cannot be read back. As with SetAckResponder, false is not proof
+   * of passive state: an implementation that cannot verify its own rollback
+   * logs that rather than claiming it. Clear is a non-throwing best effort
+   * and does not promise the MAC stops responding - a die that matches on an
+   * address alone will answer for whatever address is left programmed.
+   *
+   * A LATER PORT-0 CLAIMANT IS BACKEND-SPECIFIC, and a caller must not assume
+   * either rule. SetAckResponder, ClearAckResponder and StartBeacon all want
+   * the same port identity a station holds. A backend may REFUSE them while a
+   * station is armed (return false, station stays armed), or let them proceed
+   * and drop the station arm. The MT7612U does the latter: a verified move of
+   * the port identity drops the station arm with a WARN (a write that leaves
+   * it where it was drops nothing; a StartBeacon that fails and unwinds it
+   * back restores the arm), SetAckResponder returns true,
+   * and the station stops being acknowledged until it is re-armed - and under
+   * the managed receive filter stops receiving too (measured there: reception
+   * goes to zero). So after any of those calls on a live station, re-check
+   * the station arm (re-arm, or ClearStationIdentity) rather than inferring
+   * it from the call's return value.
+   *
+   * TRANSMISSION IS NOT PART OF THE ARM. This covers what the MAC receives
+   * and acknowledges. A station's own unicast (management, EAPOL, data) must
+   * request an ACK in its radiotap - build_stream_radiotap(mode, false),
+   * the no_ack argument; the default stream radiotap is NOACK, which never
+   * retries - and the hardware retransmits an unacknowledged frame only
+   * DeviceConfig::tx.retry_limit times, whose default is 0. A station
+   * session sets a nonzero limit explicitly; left at the default it sends
+   * each unicast frame once.
+   *
+   * Gate this on AdapterCaps::station_mode_ok rather than on a nullptr check;
+   * the default here returns false for every backend that has not ported it,
+   * which is all of them until a backend says otherwise. */
+  virtual bool SetStationIdentity(const devourer::MacAddr &own,
+                                  const devourer::MacAddr &bssid) {
+    (void)own;
+    (void)bssid;
+    return false;
+  }
+  /* Returns whether the pre-arm state was restored AND verified. On a
+   * backend whose arm wrote nothing there is nothing to undo and this is
+   * trivially true; on one that moved a filter or a MACID, a false return is
+   * the only way a caller learns the rollback could not be confirmed - the
+   * same contract SetAckResponder's clear half carries. It is not `void` for
+   * exactly that reason: a void clear would make an unverifiable rollback
+   * unreportable on the backends where rollback is real.
+   *
+   * The not-ported default returns TRUE: its SetStationIdentity arms nothing,
+   * so there is nothing to undo - the "trivially true" case above. A false
+   * here would report an unverified rollback for a port nothing touched. */
+  virtual bool ClearStationIdentity() { return true; }
 
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data
@@ -363,8 +457,10 @@ public:
    * chip's crystal and is latched into every RX descriptor at receive
    * (rx_pkt_attrib::tsfl, the low 32 bits), so it is a precise, host-jitter-free
    * timing reference for multi-radio sync / TDOA / scheduled bursts. Returns 0
-   * where unsupported (default). NB: a register read is a control transfer —
-   * calling it concurrently with a heavy RX bulk-IN load can race (catch the
+   * where unsupported (default, and the RTL8733B). Over USB a failed read
+   * throws std::ios_base::failure on every backend that implements it; a PCIe
+   * register read cannot report failure at all (src/RtlTsf.h). NB: a register read is a control transfer — calling
+   * it concurrently with a heavy RX bulk-IN load can race (catch the
    * exception). */
   virtual uint64_t ReadTsf() { return 0; }
 
@@ -372,12 +468,29 @@ public:
    * — the primitive for TSF *adoption* (a slave slewing its clock onto the
    * master's, so its per-frame `tsfl` reads in the master's timebase). The
    * counter keeps running, so a read-add-write shifts by an approximate delta (a
-   * control loop absorbs the read→write latency). NOTE: this moves the reported
-   * TSF (and the beacon-body timestamp) but NOT the beacon TBTT air-time — a
-   * separate per-port timer drives the TBTT (bench-proven). To steer the
-   * hardware-timed beacon (the uplink timing-advance actuator) use
-   * AdjustBeaconTiming. No-op where unsupported. */
-  virtual void WriteTsf(uint64_t tsf) { (void)tsf; }
+   * control loop absorbs the read→write latency). NOTE: on Jaguar2/3 this moves
+   * the reported TSF (and the beacon-body timestamp) but NOT the beacon TBTT
+   * air-time — a separate per-port timer drives the TBTT (bench-proven). On
+   * Jaguar1 the TBTT is recorded as hardware-locked to the TSF grid
+   * (PinBeaconTbtt, bench on all three dies), so expect a write there to move
+   * an active beacon's TBTT with it; neither that nor whether the beacon keeps
+   * airing without the steer's re-download was measured through this call. To
+   * steer the hardware-timed beacon (the uplink timing-advance actuator) use
+   * AdjustBeaconTiming.
+   *
+   * Two questions, two answers. Whether this part HAS a standalone TSF write is
+   * static: AdapterCaps::tsf_write_ok, resolved at construction — check it once
+   * rather than inferring it from a return value. The return value is per call:
+   * true when the transport accepted the write (backend-specific; the Realtek
+   * rule, including the PCIe readback, is devourer::write_tsftr in
+   * src/RtlTsf.h), false when it did not OR when tsf_write_ok is false (the
+   * default here). So on a tsf_write_ok part, false is a transport failure and
+   * the counter may be half-updated: read back, and retry only while the device
+   * is still present - a device that has gone reports false on every call. True
+   * is not a byte-for-byte proof either: the counter keeps running, so a caller
+   * that needs certainty reads back. Per-backend state and the measured readbacks:
+   * docs/time-distribution.md. */
+  virtual bool WriteTsf(uint64_t tsf) { (void)tsf; return false; }
 
   /* Load a beacon into the beacon reserved-page + enable the MAC beacon function,
    * so the chip AUTO-TRANSMITS it at each TBTT — hardware-timed and
@@ -418,7 +531,10 @@ public:
    * process does NOT silence it (bench-bitten: a killed probe's beacon kept
    * airing and contaminated the next test's witness) — so any beaconing
    * session that ends without a device power-cycle must call this. Idempotent;
-   * returns false when no beacon was active. */
+   * returns false when no beacon was active. Jaguar1 additionally reads back
+   * its three stop controls and returns false if any remains active; that
+   * failure must be retried (or followed by hardware shutdown) before its
+   * shared port is reused. */
   virtual bool StopBeacon() { return false; }
 
   /* Disable / restore the MAC carrier-sense gate that defers TX — both primary
@@ -450,8 +566,8 @@ public:
    * REG_BCN_INTERVAL tweak: runs one beacon interval at (nominal + round(µs/1024))
    * TU then restores nominal, so the next TBTT — and the cadence thereafter —
    * shifts by that many TU. This is the beacon-timing / uplink timing-advance
-   * actuator: WriteTsf moves the reported TSF but NOT the TBTT air-time (a
-   * separate per-port timer drives it), whereas the interval tweak steers it
+   * actuator: on Jaguar2/3 WriteTsf moves the reported TSF but NOT the TBTT
+   * air-time (a separate per-port timer drives it), whereas the interval tweak steers it
    * deterministically (the 802.11 IBSS/TSF-merge mechanism; bench-proven to the
    * microsecond). Requires an active StartBeacon. BLOCKS the caller ~one beacon
    * interval (the tweaked interval must latch and fire once before restore).
@@ -546,67 +662,100 @@ public:
    * all-zero snapshot. */
   virtual devourer::TxStats GetTxStats() { return {}; }
 
-  /* Frame-free RX energy / channel-busy snapshot (see RxSense.h) — the read side
-   * of the DEVOURER_CW_TONE emitter, used for spectrum-sensing / interferer
-   * detection. Reads the chip's phydm false-alarm + CCA counters, DIG/IGI, and
-   * (when asked) the NHM power histogram. FA/CCA counts are the delta since the
-   * previous call. Default returns an all-invalid snapshot; each generation
-   * overrides with a real reader.
-   *
-   * `with_nhm` is a cost decision, not a preference: the NHM read arms a ~2 ms
-   * measurement window and then polls a ready bit at 1 ms granularity
-   * (src/NhmReader.h), so it dominates the call — the scalar FA/CCA/IGI path is
-   * a handful of register reads. Pass false for the throwaway read that resets
-   * the delta counters before an observation window, and for any caller
-   * sampling faster than a few times a second. */
-  virtual RxEnergy GetRxEnergy(bool with_nhm) { (void)with_nhm; return {}; }
-
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the
    * runtime feed a closed-loop adaptive-link controller reads instead of
    * scraping the demo's stdout. Fuses the per-frame RSSI/SNR/EVM aggregate the
    * device accumulates internally, a passive noise-floor estimate (rssi - snr,
    * the self-jamming signal), the frame-free FA/CCA/IGI energy, and the
-   * LinkHealth verdict. Drains the window (delta semantics) and SUBSUMES
-   * GetRxEnergy (it calls it internally + consumes the FA/CCA delta — don't also
-   * poll GetRxEnergy separately on the same cadence). Default is an all-invalid
+   * LinkHealth verdict. Drains the window (delta semantics); on the Realtek
+   * backends it consumes the same FA/CCA/IGI delta that IRtlRadio::GetRxEnergy
+   * reads, so do not poll both on the same cadence. Default is an all-invalid
    * snapshot; each generation overrides. */
   virtual devourer::RxQuality GetRxQuality() { return {}; }
 
-  /* --- Adapter-health probes (see src/AdapterHealth.h; examples/doctor is
-   * the reference consumer) --- */
+  /* Frame-free channel-occupancy snapshot (see ChannelBusy in RxSense.h) — the
+   * vendor-NEUTRAL half of frame-free sensing, and the only energy evidence
+   * src/chanmig/ and src/hopset/ can ask an arbitrary backend for. Busy
+   * airtime (both silicon families count it in hardware) plus, where the
+   * family has one, the share of energy above the receiver's own floor.
+   *
+   * Delta semantics: the window drains on read. On the Realtek backends this
+   * is IMPLEMENTED BY GetRxEnergy(true), so GetRxEnergy, GetRxQuality and this
+   * all consume the same counters — poll one of the three, not two.
+   *
+   * Cost is NOT symmetric across families: the Realtek path arms a ~2 ms CCX
+   * measurement window and polls a ready bit at 1 ms granularity, while the
+   * MediaTek path is two register reads. A caller written against the cheap
+   * one will stall on the expensive one; this is a dwell-cadence call.
+   *
+   * The Realtek-only phydm detail (false-alarm classes, DIG/IGI, the NHM
+   * histogram) stays on IRtlRadio::GetRxEnergy; this is its portable
+   * reduction. Default is an all-invalid snapshot; a backend with a hardware
+   * busy-airtime counter overrides. Advertised by AdapterCaps::busy_airtime_ok
+   * — do NOT infer support from a successful dynamic_cast to IRtlRadio, which
+   * was never a correct discriminator. */
+  virtual devourer::ChannelBusy GetChannelBusy() { return {}; }
 
-  /* Perform `reads` fresh PHYSICAL EFUSE logical-map reads (each pass re-runs
-   * the efuse-controller read sequence — not the cached shadow) and
-   * cross-compare them. Dying silicon returns different content per read;
-   * healthy silicon is byte-identical every time. Post-bring-up only: returns
-   * supported=false before Init/InitWrite (on the 8814AU a pre-fwdl EFUSE
-   * read breaks the RSVD-page firmware download). Control-plane threading
-   * contract applies (same as SetMonitorChannel). */
-  virtual devourer::EfuseStability ProbeEfuseStability(int reads = 4) {
-    (void)reads;
-    return {};
+  /* Arm a busy-airtime window of `window_us` and read it later with
+   * GetChannelBusy(), instead of taking whatever window the backend samples
+   * on its own. Returns the window ACTUALLY armed in microseconds (the
+   * hardware's granularity and limits clamp it, so a caller that needs to
+   * know its own denominator reads the return value, not its request);
+   * 0 means this backend cannot arm one and the caller should keep using the
+   * sampled GetChannelBusy() path.
+   *
+   * Why it exists: the sampled path is a ~2 ms hardware window on Realtek,
+   * which is a sample rather than a measurement of the caller's dwell. On a
+   * 50 ms-on/450 ms-off interferer, one such read per 300 ms measured ZERO in
+   * 55 of 71 windows and ~63% in the rest while frames were decoded in nearly
+   * every window; the same load read 8.1-9.5% per second on the MediaTek
+   * timers, which integrate. An armed window makes both families report busy
+   * airtime over the CALLER's window instead of over whatever each backend
+   * samples on its own — not an identical measurement: the Realtek window is
+   * hardware-timed and counts receive-side deferral, the MediaTek one is the
+   * host-measured arm-to-read gap and counts own TX. ChannelBusy::source,
+   * ::window_us and ::own_tx_in_window carry those differences.
+   *
+   * Contract: arm where the caller resets its own counters, read at the end
+   * of the dwell. A window is spoiled by an NHM read (IRtlRadio::GetRxEnergy
+   * with with_nhm, which re-arms the shared CCX engine), by a retune, and by
+   * reading before it has elapsed; the reading then comes back INVALID rather
+   * than plausible-but-wrong.
+   *
+   * A window also does not outlive its hardware session: Stop() forgets it.
+   * Without that a window armed before a teardown stays reachable afterwards
+   * — by different mechanisms on different backends, so clearing whatever
+   * flag guards the engine is not a substitute — and the next retune's note
+   * stamps it Retuned, a reason earned by a session that no longer exists.
+   * Measured on all four Realtek backends. The reading is invalid either
+   * way, so what a missing reset costs is the REASON, which is the whole
+   * point of the spoil field. A backend implementing this owes the reset;
+   * the per-generation guides record how far each teardown goes.
+   *
+   * What the reset does NOT close: it forgets a window armed BEFORE the
+   * teardown. Where nothing clears the flag the engine's own accessor gates
+   * on, an arm issued AFTER Stop() still succeeds against a chip that has
+   * been torn down — true of Jaguar1/2/3, whose gate is never cleared, and
+   * not of the RTL8733B, whose Stop() clears it. Closing it everywhere is a
+   * behaviour change on paths that flag also guards.
+   *
+   * A spoiled or completed window is consumed by
+   * the read; a not-yet-elapsed one stays armed, so the caller reads again
+   * at the end of its dwell instead of re-arming. Single control thread, like
+   * every other control-plane entry point. */
+  virtual uint32_t ArmChannelBusy(uint32_t window_us) {
+    (void)window_us;
+    return 0;
   }
+
+  /* --- Adapter health (see src/AdapterHealth.h; examples/doctor is the
+   * reference consumer; the EFUSE probe is on IRtlRadio) --- */
 
   /* Outcome of the most recent firmware download (populated during
    * Init/InitWrite). On Jaguar1 a failed FW boot does not abort bring-up —
    * this is the only place the failure is visible to a caller. */
   virtual devourer::FwBootStatus GetFwBootStatus() { return {}; }
 
-  /* Dump the chip's canary register set (BB / MAC / per-path RF) to the
-   * diagnostic plane. Reads only — no writes, no calibration, no bring-up.
-   *
-   * The point is that it is callable on a device that has NOT been Init'ed, so
-   * a chip left in whatever state a previous session abandoned it in can be
-   * inspected AS IT IS. Every other path into this driver reconfigures the chip
-   * on the way in, which destroys exactly the evidence a state bug leaves
-   * behind. Pair it with an open that skips libusb_reset_device
-   * (claim_interface_then_reset's `do_reset=false`) — a USB reset re-runs the
-   * chip's own boot and is just as destructive.
-   *
-   * Output format matches DEVOURER_DUMP_CANARY, so two dumps diff directly with
-   * tests/canary_diff.py. Reading a powered-down chip yields garbage or throws;
-   * interpreting that is the caller's job. No-op where unsupported (default). */
-  virtual void DumpChipState() {}
 };
 
-#endif /* IRTL_DEVICE_H */
+#endif /* IRADIO_H */

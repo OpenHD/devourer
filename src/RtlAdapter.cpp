@@ -23,12 +23,12 @@ RtlAdapter::RtlAdapter(libusb_device_handle *dev_handle, Logger_t logger,
     : _transport{std::make_shared<devourer::UsbTransport>(
           dev_handle, logger, ctx, std::move(usb_lock), cfg.usb.rx_zerocopy,
           cfg.rx.rx_mode, cfg.rx.pool_spare, cfg.rx.ring_ms.value_or(0),
-          cfg.rx.pool_exhaust)},
+          cfg.rx.pool_exhaust, cfg.tx.no_cancel_multipkt)},
       _logger{std::move(logger)} {
   init_from_transport(cfg);
 }
 
-RtlAdapter::RtlAdapter(std::shared_ptr<devourer::IRtlTransport> transport,
+RtlAdapter::RtlAdapter(std::shared_ptr<devourer::ITransport> transport,
                        Logger_t logger, const devourer::DeviceConfig &cfg)
     : _transport{std::move(transport)}, _logger{std::move(logger)} {
   init_from_transport(cfg);

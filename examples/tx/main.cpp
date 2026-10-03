@@ -48,6 +48,7 @@
 #include "SweepSpec.h"
 #include "TxPower.h" /* txpkt_pwr_db_for_step — DEVOURER_TX_PKT_OFSET fan-out */
 #include "caps_event.h"
+#include "station_arm_env.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
 #endif
@@ -311,7 +312,9 @@ static bool hopset_sense_window(IRtlRadio *dev, uint32_t settle_us,
   return true;
 }
 
-static int g_rx_count = 0;
+/* Atomic: the station arm reads it from the main thread as proof the RX loop
+ * is running. */
+static std::atomic<int> g_rx_count{0};
 /* Windowed RX receipts (src/cell/RxReceipt.h): DEVOURER_TX_RECEIPTS=1 arms
  * the transmitter-side ledger. Receipts name our TA — DEVOURER_TX_SA when
  * set, else the canonical SA — and anything else refuses to absorb. */
@@ -325,7 +328,7 @@ static void packetProcessor(const Packet &packet) {
    * Jaguar3), not 802.11 frames — skip before counting/parsing. */
   if (packet.RxAtrib.pkt_rpt_type == RX_PACKET_TYPE::C2H_PACKET)
     return;
-  ++g_rx_count;
+  const int rx_n = ++g_rx_count;
   /* Windowed RX receipts (DEVOURER_TX_RECEIPTS=1, needs TX_WITH_RX=thread):
    * a plain data frame whose body parses as a receipt TLV naming OUR TA is
    * the receiver's delivered-set update (src/cell/RxReceipt.h). Every
@@ -352,9 +355,9 @@ static void packetProcessor(const Packet &packet) {
   }
   /* RX liveness marker for the TX+RX=thread mode: first frame + every 500th.
    * Without it a deaf RX loop is indistinguishable from a quiet channel. */
-  if (g_rx_count == 1 || g_rx_count % 500 == 0) {
+  if (rx_n == 1 || rx_n % 500 == 0) {
     devourer::Ev(*g_ev, "rx.count")
-        .f("total", g_rx_count)
+        .f("total", rx_n)
         .f("len", packet.Data.size());
   }
   /* BF self-sounding report detector (DEVOURER_BF_DETECT_REPORT modes 1-4,
@@ -372,7 +375,7 @@ static void packetProcessor(const Packet &packet) {
       /* rx.txhit fields are parsed by tests/regress.py — keep names stable. */
       devourer::Ev(*g_ev, "rx.txhit")
           .f("hits", hits)
-          .f("total_rx", g_rx_count)
+          .f("total_rx", rx_n)
           .f("len", packet.Data.size());
     }
   }
@@ -693,6 +696,22 @@ int main(int argc, char **argv) {
    * nothing reaches the air" (issue #36). This thread polls EP 0x85 until
    * the process is killed; failures other than -ETIMEDOUT are logged once
    * per N. */
+  /* DEVOURER_STA_IDENTITY (examples/common/station_arm_env.h). Here it needs
+   * DEVOURER_TX_WITH_RX=thread: IRadio orders the arm after the RX loop, and
+   * a station that cannot hear its ACKs is not one. Checked before any
+   * thread below is started, so a refusal returns with nothing to join. */
+  bool sta_bad = false;
+  const auto sta_req = devourer::station_arm_request_from_env(logger, sta_bad);
+  if (sta_bad)
+    return 1;
+  if (sta_req) {
+    const char *twr = std::getenv("DEVOURER_TX_WITH_RX");
+    if (twr == nullptr || std::string(twr) != "thread") {
+      logger->error("DEVOURER_STA_IDENTITY needs DEVOURER_TX_WITH_RX=thread "
+                    "on txdemo");
+      return 1;
+    }
+  }
   /* Optional bulk-IN drainer on EP 0x81 — gated by DEVOURER_DRAIN_BULK_IN=1.
    * The kernel `88XXau` driver pre-arms 8 bulk-IN URBs of 32 KB each on
    * EP 0x81 at the end of init, *before* the first TX. The RTL8814AU
@@ -1039,8 +1058,11 @@ int main(int argc, char **argv) {
    * StartRxLoop assumes the chip is up and takes over bulk-IN; send_packet's
    * bulk-OUT is safe alongside it. packetProcessor runs on this thread. */
   std::thread rx_thread;
+  /* Set once StartRxLoop has returned or thrown - the RX loop is gone. The
+   * station arm below refuses on it. */
+  std::atomic<bool> rx_ended{false};
   if (rx_thread_mode) {
-    rx_thread = std::thread([&rtlDevice, logger] {
+    rx_thread = std::thread([&rtlDevice, &rx_ended, logger] {
       /* An uncaught exception in a std::thread is std::terminate — a transient
        * USB read failure in the RX loop must not tear down the TX process. */
       try {
@@ -1048,8 +1070,45 @@ int main(int argc, char **argv) {
       } catch (const std::exception &e) {
         logger->error("RX loop died: {} (TX continues)", e.what());
       }
+      rx_ended = true;
     });
     logger->info("DEVOURER_TX_WITH_RX=thread: RX loop started alongside TX");
+  }
+
+  /* DEVOURER_STA_IDENTITY: arm before the first frame, once the RX loop is
+   * shown running - its first received frame (3 s cap: a silent channel still
+   * arms) - and refuse if it has failed or ended (rx_ended). A refused arm
+   * sends nothing and exits 1 - frames from an unarmed station must not be
+   * scored as a station's. */
+  std::atomic<bool> sta_stop{false};
+  std::thread sta_clear_thread;
+  /* Joins the scheduled clear on every exit path, the early returns below
+   * included - a joinable std::thread destructor terminates the process. */
+  struct StaClearJoin {
+    std::atomic<bool> &stop;
+    std::thread &t;
+    ~StaClearJoin() {
+      stop = true;
+      if (t.joinable())
+        t.join();
+    }
+  } sta_clear_join{sta_stop, sta_clear_thread};
+  bool sta_failed = false;
+  if (sta_req) {
+    for (int s = 0; s < 3000 && !rx_ended.load() && !g_devourer_should_stop &&
+                    g_rx_count.load() == 0;
+         s += 50)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!devourer::station_arm_run(rtlDevice, *sta_req, *g_ev, logger,
+                                   sta_stop, &rx_ended)) {
+      sta_failed = true;
+      g_devourer_should_stop = true;
+    } else if (sta_req->clear_after_ms > 0) {
+      const devourer::StationArmRequest req = *sta_req;
+      sta_clear_thread = std::thread([&sta_stop, rtlDevice, req, logger]() {
+        devourer::station_clear_after(rtlDevice, req, *g_ev, logger, sta_stop);
+      });
+    }
   }
 
   uint8_t beacon_frame[] = {
@@ -1380,6 +1439,36 @@ int main(int argc, char **argv) {
     if (tx_threads > 1)
       logger->info("DEVOURER_TX_THREADS — {} parallel senders", tx_threads);
   }
+  /* DEVOURER_TX_ALT_RATE=<rate spec> — every ODD-counter frame carries its own
+   * rate radiotap built from this spec (the DEVOURER_TX_RATE grammar, /NOAGG
+   * included); even frames keep the rate-less default. Needs
+   * DEVOURER_TX_QOS_DATA: the receiver tells the two apart by the stamped
+   * counter's parity (rx.seq pctr). The A-MPDU mixed-rate harness
+   * (tests/tx_no_agg_onair.sh). Replaces the frame each send, so it does not
+   * combine with the hop markers or DEVOURER_TX_STBC_TOGGLE. */
+  std::vector<uint8_t> tx_base_buf, tx_alt_buf;
+  if (const char *e = std::getenv("DEVOURER_TX_ALT_RATE")) {
+    if (!qos_stamp) {
+      logger->warn("DEVOURER_TX_ALT_RATE needs DEVOURER_TX_QOS_DATA — ignored");
+    } else {
+      const size_t rl = tx_buf[2] | (tx_buf[3] << 8);
+      tx_base_buf = tx_buf;
+      /* NOACK like the base frame's rate-less radiotap. */
+      tx_alt_buf =
+          devourer::build_stream_radiotap(devourer::parse_tx_mode_str(e));
+      tx_alt_buf.insert(tx_alt_buf.end(), tx_buf.begin() + rl, tx_buf.end());
+      logger->info("DEVOURER_TX_ALT_RATE={} — odd-counter frames", e);
+    }
+  }
+  /* Stamp the QoS per-frame counter at MPDU bytes 26..29 (after the frame's
+   * own radiotap), picking the ALT_RATE variant by parity first. */
+  auto stamp_counter = [&](std::vector<uint8_t> &b, uint32_t v) {
+    if (!tx_alt_buf.empty())
+      b = (v & 1) ? tx_alt_buf : tx_base_buf;
+    const size_t rl = b.size() >= 4 ? (b[2] | (b[3] << 8)) : b.size();
+    if (qos_stamp && b.size() >= rl + 26 + 4)
+      std::memcpy(b.data() + rl + 26, &v, 4);
+  };
   std::atomic<long> tx_counter{0}; /* shared frame-stamp source (threads>1) */
   std::vector<std::thread> tx_aux;
 
@@ -2338,10 +2427,7 @@ int main(int argc, char **argv) {
     /* QoS spike frames carry a per-frame counter at body[0..3] (MPDU bytes
      * 26..29) so the receiver can count UNIQUE frames vs hardware re-airings
      * (the A-MPDU engine renumbers seqs per aggregate, so seq can't). */
-    if (qos_stamp && tx_buf.size() >= 10 + 26 + 4) {
-      uint32_t v = static_cast<uint32_t>(tx_count);
-      std::memcpy(tx_buf.data() + 10 + 26, &v, 4);
-    }
+    stamp_counter(tx_buf, static_cast<uint32_t>(tx_count));
     /* Lazy-start the auxiliary senders on the first main-loop pass (the
      * chip is up and the first frame primed by then). */
     if (tx_threads > 1 && tx_aux.empty()) {
@@ -2356,10 +2442,7 @@ int main(int argc, char **argv) {
                 tx_counter.fetch_add(static_cast<long>(bufs.size()));
             for (size_t k = 0; k < bufs.size(); ++k) {
               auto &b = bufs[k];
-              if (qos_stamp && b.size() >= 10 + 26 + 4) {
-                uint32_t v = static_cast<uint32_t>(base + (long)k);
-                std::memcpy(b.data() + 10 + 26, &v, 4);
-              }
+              stamp_counter(b, static_cast<uint32_t>(base + (long)k));
               views.push_back(TxPacketView{b.data(), b.size()});
             }
             rtlDevice->send_packets(views.data(), views.size());
@@ -2379,11 +2462,9 @@ int main(int argc, char **argv) {
       tx_batch_views.clear();
       for (long k = 0; k < tx_batch; ++k) {
         auto &b = tx_batch_bufs[static_cast<size_t>(k)];
-        if (qos_stamp && b.size() >= 10 + 26 + 4) {
-          uint32_t v = static_cast<uint32_t>(
-              tx_threads > 1 ? tx_counter.fetch_add(1) : tx_count + k);
-          std::memcpy(b.data() + 10 + 26, &v, 4);
-        }
+        stamp_counter(b, static_cast<uint32_t>(tx_threads > 1
+                                                   ? tx_counter.fetch_add(1)
+                                                   : tx_count + k));
         tx_batch_views.push_back(TxPacketView{b.data(), b.size()});
       }
       const size_t okn = rtlDevice->send_packets(tx_batch_views.data(),
@@ -2523,7 +2604,8 @@ int main(int argc, char **argv) {
         .f("failed", (unsigned long long)ts.failed)
         .f("was_timeout", ts.last_was_timeout ? 1 : 0)
         .f("last_rc", ts.last_error_rc)
-        .f("final", 1);
+        .f("final", 1)
+        .t();
   }
 
   /* Shard accounting: what the producer handed us versus what the chip was
@@ -2574,6 +2656,9 @@ int main(int argc, char **argv) {
 
   /* Join the RX loop BEFORE Stop(): the chip de-init must not race in-flight
    * RX URBs (and StartRxLoop's event pump must exit before libusb_exit). */
+  sta_stop = true;
+  if (sta_clear_thread.joinable())
+    sta_clear_thread.join();
   rtlDevice->StopRxLoop();
   if (rx_thread.joinable())
     rx_thread.join();
@@ -2593,5 +2678,7 @@ int main(int argc, char **argv) {
   session.close();
   /* A truncated caller stream is a producer fault, and a harness that scored
    * the run as if it had ended cleanly would be scoring a short measurement. */
+  if (sta_failed)
+    return 1;
   return stdin_truncated ? 2 : 0;
 }

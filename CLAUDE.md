@@ -249,7 +249,7 @@ those are the ones listed below.
   `DEVOURER_USB_PORT=a.b.c` select by USB topology when two adapters share
   VID:PID **and** serial.
 - `DEVOURER_CHANNEL=N` — monitor channel.
-- `DEVOURER_TX_RATE=<rate>[/<bw>][/SGI][/LDPC][/STBC][/ER|/ER106][/DCM]` — TX
+- `DEVOURER_TX_RATE=<rate>[/<bw>][/SGI][/LDPC][/STBC][/NOAGG][/ER|/ER106][/DCM]` — TX
   mode for rate-less frames (`MCS7/40/SGI`, `VHT2SS_MCS3/80/LDPC`, `1M`...).
   Unset = 6M legacy. CCK rates are 2.4 GHz-only; `1M` buys ~9 dB link budget
   over `6M`. Rate resolution never reads the band, so `VHT*` rates air on
@@ -259,7 +259,11 @@ those are the ones listed below.
   extended-range PPDU + dual-carrier modulation (`docs/he-extended-range.md`).
   The library itself is radiotap-driven — a frame carrying its own rate
   radiotap overrides the mode per-packet (ER SU = radiotap-HE FORMAT=EXT_SU).
-  Programmatic: `SetTxMode` / `ClearTxMode`.
+  Programmatic: `SetTxMode` / `ClearTxMode`. `/NOAGG` keeps the frame out
+  of an A-MPDU (`TxMode::no_agg`, `AdapterCaps::tx_no_agg_ok`,
+  `docs/aggregation.md`).
+- `DEVOURER_TX_ALT_RATE=<rate spec>` — txdemo: alternate frames at a second
+  rate (mixed-rate harness, `tests/tx_no_agg_onair.sh`).
 - `DEVOURER_SKIP_RESET=1` — skip `libusb_reset_device` before claim (only
   helps when firmware state is intact). Kestrel adapters skip the reset
   unconditionally — a USB reset on running firmware can land the chip in the
@@ -285,6 +289,11 @@ those are the ones listed below.
   degradation predictor — `docs/warm-tx-degradation.md` has delivery scattered
   63–83% with no relation to the meter, and inside one uninterrupted session
   the meter stays pinned while delivery drifts.
+- `DEVOURER_STA_IDENTITY=<own|self>,<bssid>` (rxdemo; txdemo with
+  `DEVOURER_TX_WITH_RX=thread`) — call `IRadio::SetStationIdentity` once the
+  RX loop is up, `DEVOURER_STA_CLEAR_AFTER_MS=N` to clear it later; `sta.arm`
+  / `sta.clear` events (`examples/common/station_arm_env.h`); txdemo sends
+  nothing after a refused arm. The Realtek cell is `tests/realtek_station_onair.sh`.
 - `DEVOURER_RX_BUSY_MS=N` (rxdemo) — the vendor-neutral busy-airtime window
   at a fixed cadence: arm, wait N ms, read, one `rx.busy` event per window
   (`IRadio::ArmChannelBusy`/`GetChannelBusy`, so it runs on the MT7612U where

@@ -236,6 +236,94 @@ struct AdapterCaps {
   bool ack_responder_ok = false;
   bool tx_retry_limit_ok = false;
 
+  /* station_mode_ok: IRadio::SetStationIdentity can program this MAC for the
+   * STATION half of an infrastructure BSS, and the behaviour a station needs
+   * from the silicon has been measured on air. Gate station-mode callers on
+   * this rather than on SetStationIdentity's return value alone, so a caller
+   * can refuse before it starts a handshake it cannot finish.
+   *
+   * False means "not ported / not measured", never "the silicon cannot". Do
+   * not set it from a code-reading: the bar is an on-air cell showing this
+   * adapter receiving unicast addressed to it and being ACKed for what it
+   * sends - the same shape of evidence ack_responder_ok carries, measured per
+   * die. (The MT7612U acknowledgement cells use a raw injector and an armed
+   * ACK responder as the peer, not an AP.)
+   *
+   * TRUE on MT7612U, and read docs/mt7612u-station-identity.md - its
+   * retraction section first - before quoting a number from it. Both halves
+   * of the bar are measured there, with controls: a Realtek peer's own CCX
+   * reports show this MAC acknowledging 100% of unicast addressed to it with
+   * nothing armed (0.45 mean retries, 1279 reports) against three controls
+   * pinned at the peer's 12-retry limit (a destination nobody holds, the DUT
+   * absent, and MT_AUTO_RSP_EN cleared); and the MAC's own TX status FIFO
+   * shows its uplink acknowledged 200/200 at 0.0 mean retries against a
+   * 0/200 control run to the full ladder. The uplink cell sent from the
+   * bring-up tool with an ACK-requesting TXWI and a retry limit of 15 - not
+   * a library session, whose defaults (NOACK stream radiotap, tx.retry_limit
+   * 0) send each unicast once; see IRadio::SetStationIdentity. Note the
+   * limits the measurements do NOT clear, which a caller should know:
+   *
+   *   - every cell ran an UNASSOCIATED station receiving traffic it had not
+   *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
+   *     and hardware key lookup are untested;
+   *   - those cells did not drive SetStationIdentity itself. On this part the
+   *     seam writes no register, so the measured hardware state is the state
+   *     a successful arm leaves behind, but the literal "arm through IRadio,
+   *     then measure" path is not what the cells ran;
+   *   - the cells ran the MANAGED receive filter, and the library's own RX
+   *     path does not: Mt7612uRadio::StartRxLoop calls
+   *     mt7612u_set_monitor_rx() unconditionally, so a station driven through
+   *     IRadio runs PROMISCUOUS. Acknowledgement does not depend on it (a
+   *     monitor-filter run of the same auto-ACK cell also read 100%), but the
+   *     "moving the port identity makes a station deaf" half of the rationale
+   *     is specific to the managed filter;
+   *   - two units, one peer model, one channel, near field, no soak; the
+   *     second unit reproduced the acknowledgement and uplink cells (its
+   *     uplink at 1.9 mean retries against the first unit's 0.0), not the
+   *     BSSID receive table.
+   *
+   * TRUE on the Jaguar3 8822C and the Jaguar2 8822B dies, through the
+   * Realtek arm (src/StationArm.h has how it differs from the MT7612U: it
+   * configures the port rather than checking it, and refuses the other
+   * port-0 claimants rather than being dropped by them). Both halves were
+   * measured by tests/realtek_station_onair.sh, which arms through the seam
+   * itself and reads the transmitter's own CCX reports; one RTL8812CU and
+   * one RTL8812BU, each the other's peer. Read docs/realtek-station-arm.md
+   * - its limits section above all (one unit, two runs on one rig, near
+   * field, one AP type; what "received" means; the report gap) - before
+   * quoting:
+   *
+   *                  8812CU station          8812BU station
+   *   A armed        100.0% ok, 0.03 retries 100.0% ok, 0.33 retries
+   *   B nobody       0.0%, 12.00             0.0%, 12.00
+   *   C DUT absent   0.0%, 12.00             0.0%, 12.00
+   *   D unarmed      0.0%, 12.00             0.0%, 12.00
+   *   E cleared      0.0%, 12.00             0.0%, 12.00
+   *   F uplink->AP   100.0%, 0.09            100.0%, 0.20
+   *   G uplink->none 0.0%, 12.00             0.0%, 12.00
+   *   H unarmed F    100.0%, 0.08            100.0%, 0.20
+   *
+   * (Current record; an earlier record on the same rig matches it.) The
+   * flag rests on both halves met WHILE ARMED. H shows the uplink half holds
+   * without the arm too - the AP acknowledges by address - so on these dies
+   * the arm is what the DOWN half needs (D and E at 0%).
+   *
+   * FALSE on the other Realtek dies, where SetStationIdentity is ported and
+   * unmeasured: the 8822E (not measured by this cell), the 8821C, and every
+   * Jaguar1 die (8812, 8814A, 8821A, the 8811AU cut).
+   *
+   * FALSE on Kestrel and the RTL8733B: not ported. */
+  bool station_mode_ok = false;
+
+  /* TxMode::no_agg is honoured: a frame carrying the radiotap TX_FLAGS
+   * kRadiotapTxFlagNoAgg bit (RadiotapTxFlags.h) airs as its own PPDU at its
+   * own rate and bandwidth even while SetAmpduMode is on. TRUE on Jaguar3,
+   * on-air-measured on one 8812EU and one 8812CU (tests/tx_no_agg_onair.sh;
+   * the 8822C folds deeper and pays more for the flag, docs/aggregation.md).
+   * False everywhere else: the bit is ignored and a flagged frame can still
+   * be folded into an aggregate at its neighbour's rate. */
+  bool tx_no_agg_ok = false;
+
   /* --- feature flags --- */
   /* Per-packet TX power: a per-frame power trim driven by radiotap
    * DBM_TX_POWER (dB delta vs the calibrated table / session base) or a

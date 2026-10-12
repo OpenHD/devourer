@@ -138,7 +138,13 @@ struct TssiDePlan8733b {
   std::array<int8_t, 2> ofdm{};
   std::array<int8_t, 2> ht20{};
 
-  bool operator==(const TssiDePlan8733b &) const = default;
+  bool operator==(const TssiDePlan8733b &other) const {
+    return cck == other.cck && ht40 == other.ht40 &&
+           ofdm == other.ofdm && ht20 == other.ht20;
+  }
+  bool operator!=(const TssiDePlan8733b &other) const {
+    return !(*this == other);
+  }
 };
 
 struct TssiDeState8733b {

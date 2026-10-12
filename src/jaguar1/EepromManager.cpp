@@ -210,12 +210,11 @@ void EepromManager::read_chip_version_8812a(RtlAdapter device) {
         (value32 & RF_TYPE_ID) ? RF_TYPE_1T1R : RF_TYPE_2T2R;
   }
 
-  version_id = {
-      .ICType = ic_type,
-      .ChipType = (value32 & RTL_ID) ? TEST_CHIP : NORMAL_CHIP,
-      .VendorType = (value32 & VENDOR_ID) ? CHIP_VENDOR_UMC : CHIP_VENDOR_TSMC,
-      .RFType = rf_type,
-  };
+  version_id = HAL_VERSION{};
+  version_id.ICType = ic_type;
+  version_id.ChipType = (value32 & RTL_ID) ? TEST_CHIP : NORMAL_CHIP;
+  version_id.VendorType = (value32 & VENDOR_ID) ? CHIP_VENDOR_UMC : CHIP_VENDOR_TSMC;
+  version_id.RFType = rf_type;
 
   /* Manual override: force 1T1R even when SYS_CFG reports 2T2R
    * (useful if EFUSE/strap is mis-burnt on a 1T1R board). Only meaningful

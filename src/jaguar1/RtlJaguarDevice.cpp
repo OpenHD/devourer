@@ -1,3 +1,4 @@
+#include "CancellableThread.h"
 #include "RtlJaguarDevice.h"
 #include "jaguar1/BeaconPort.h"
 #include "BeamformingSounder.h"
@@ -1748,7 +1749,7 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
    * immediately after completed bring-up rather than before SetAckResponder.
    * Its local lifetime also makes exceptional/normal RX-loop exit cancel and
    * join an outstanding long-delay request. */
-  std::jthread ack_disarm_thread;
+  devourer::CancellableThread ack_disarm_thread;
   std::optional<uint32_t> ack_disarm_after_ms;
   {
     std::lock_guard<std::recursive_mutex> lock(_port0_mu);
@@ -1761,8 +1762,8 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
                      "ACK arm to associate with the delayed clear");
     } else {
       const uint64_t arm_generation = *configured_arm_generation;
-      ack_disarm_thread = std::jthread(
-        [this, delay_ms, arm_generation](std::stop_token stop) {
+      ack_disarm_thread = devourer::CancellableThread(
+        [this, delay_ms, arm_generation](devourer::StopToken stop) {
           const auto deadline = std::chrono::steady_clock::now() +
                                 std::chrono::milliseconds(delay_ms);
           while (!stop.stop_requested() &&

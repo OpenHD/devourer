@@ -1,3 +1,4 @@
+#include "CancellableThread.h"
 #include "Rtl8733bDevice.h"
 
 #include <algorithm>
@@ -200,12 +201,12 @@ void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
      * completed under _reg_mu, so even a zero delay cannot clear a cold port
      * and then be undone by SetAckResponder later in Init. jthread's stop
      * request bounds normal/exceptional shutdown even for a very long delay. */
-    std::jthread ack_disarm_thread;
+    devourer::CancellableThread ack_disarm_thread;
     if (_ack_disarm_after_ms) {
       const uint32_t delay_ms = *_ack_disarm_after_ms;
       _ack_disarm_after_ms.reset();
-      ack_disarm_thread = std::jthread(
-          [this, delay_ms](std::stop_token stop) {
+      ack_disarm_thread = devourer::CancellableThread(
+          [this, delay_ms](devourer::StopToken stop) {
             const auto deadline = std::chrono::steady_clock::now() +
                                   std::chrono::milliseconds(delay_ms);
             while (!stop.stop_requested() &&

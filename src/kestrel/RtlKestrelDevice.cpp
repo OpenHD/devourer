@@ -2,7 +2,7 @@
 
 #include <climits> /* INT_MIN = "no radiotap DBM_TX_POWER" sentinel */
 #include <cstdint>
-#include <span>
+#include "PacketSpan.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -396,7 +396,7 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
                 _rxq.add(_last_physts.rssi[0], _last_physts.snr_avg, 0);
               _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm, 2);
             }
-            p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.payload),
+            p.Data = devourer::PacketSpan<uint8_t>(const_cast<uint8_t *>(f.payload),
                                         f.payload_len);
             packetProcessor(p);
           } else if (f.rpkt_type == kestrel::RPKT_TYPE_C2H) {

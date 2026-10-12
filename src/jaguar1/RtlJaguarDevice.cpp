@@ -1937,7 +1937,7 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
     cfo_tick();
     FrameParser fp{_logger};
     for (auto &p : fp.recvbuf2recvframe(
-             std::span<uint8_t>{const_cast<uint8_t *>(data), (size_t)n})) {
+             devourer::PacketSpan<uint8_t>{const_cast<uint8_t *>(data), (size_t)n})) {
       if (should_stop || g_devourer_should_stop)
         break;
       /* physt: the descriptor says the PHY wrote a status report for THIS

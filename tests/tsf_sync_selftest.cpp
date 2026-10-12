@@ -74,7 +74,7 @@ int main() {
     const uint64_t egress = 0x0000000123456789ULL;
     for (int i = 0; i < 8; ++i) beacon[24 + i] = (uint8_t)(egress >> (8 * i));
     Packet bp;
-    bp.Data = std::span<uint8_t>(beacon, sizeof(beacon));
+    bp.Data = devourer::PacketSpan<uint8_t>(beacon, sizeof(beacon));
     bp.RxAtrib.tsfl = 0x11223344u;
     CHECK(s.Add(bp), "beacon accepted by Packet convenience");
     CHECK(s.Count() == 1, "beacon counted");
@@ -82,7 +82,7 @@ int main() {
     uint8_t data[40] = {0};
     data[0] = 0x08;                              // data frame — no egress TSF
     Packet dp;
-    dp.Data = std::span<uint8_t>(data, sizeof(data));
+    dp.Data = devourer::PacketSpan<uint8_t>(data, sizeof(data));
     dp.RxAtrib.tsfl = 0x55667788u;
     CHECK(!s.Add(dp), "data frame rejected by Packet convenience");
     CHECK(s.Count() == 1, "data frame not counted");

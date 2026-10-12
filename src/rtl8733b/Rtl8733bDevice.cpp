@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <span>
+#include "PacketSpan.h"
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -428,7 +428,7 @@ void Rtl8733bDevice::StartRxLoop(
             data + offset + rtl8733b::kRxDescSize, frame.drvinfo_size,
             frame.rx_rate, _rx_configured_bw.load(),
             packet.RxAtrib);
-      packet.Data = std::span<uint8_t>(const_cast<uint8_t *>(frame.frame),
+      packet.Data = devourer::PacketSpan<uint8_t>(const_cast<uint8_t *>(frame.frame),
                                        frame.frame_len);
       if (rx_packet_processor)
         rx_packet_processor(packet);

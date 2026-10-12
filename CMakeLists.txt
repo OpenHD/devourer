@@ -1770,6 +1770,16 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(mt7612u_initvals_generated PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+add_executable(PacketSpanSelftest tests/packet_span_selftest.cpp)
+target_include_directories(PacketSpanSelftest PRIVATE src)
+target_compile_features(PacketSpanSelftest PRIVATE cxx_std_20)
+add_test(NAME packet_span_native COMMAND PacketSpanSelftest)
+add_executable(PacketSpanFallbackSelftest tests/packet_span_selftest.cpp)
+target_include_directories(PacketSpanFallbackSelftest PRIVATE src)
+target_compile_features(PacketSpanFallbackSelftest PRIVATE cxx_std_17)
+target_compile_definitions(PacketSpanFallbackSelftest PRIVATE DEVOURER_FORCE_PACKET_SPAN_FALLBACK)
+add_test(NAME packet_span_fallback COMMAND PacketSpanFallbackSelftest)
+
 # --- selftest aggregate ----------------------------------------------------
 # `cmake --build build --target selftests` builds every headless test binary in
 # one go. The mingw CI job builds this instead of a hand-maintained target list:

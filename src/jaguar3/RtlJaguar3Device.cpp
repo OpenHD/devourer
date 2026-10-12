@@ -403,7 +403,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * a caller needs to tell which A-MPDU subframe the report belonged to.
          * `phy` is the local that says which fields are safe to fold. */
         p.RxAtrib.physt = f.physt;
-        p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
+        p.Data = devourer::PacketSpan<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
         if (!p.RxAtrib.crc_err && phy != PhyStsFill::None) {
           _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
           _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,

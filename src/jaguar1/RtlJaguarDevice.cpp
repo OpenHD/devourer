@@ -1964,7 +1964,7 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         const devourer::TxReport r =
             devourer::parse_ccx_8812(p.Data.data() + 2, p.Data.size() - 2);
         if (r.valid)
-          devourer::emit_tx_report(_logger->events(), r, "8812");
+          DeliverTxReport(_logger->events(), r, "8812");
       }
       _packetProcessor(p);
     }
@@ -2312,6 +2312,10 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into
                               * beacons (bench: 8821AU + 8814AU body-TS steps
                               * live at the beacon interval) */
+  c.hw_injected_mgmt_txtsf = false; /* measured on the 8821AU: an injected
+                              * probe response / beacon gets a counter that is
+                              * not a TSF (AdapterCaps.h) — the hardware beacon
+                              * above is this family's egress-stamped frame */
   c.tsf_write_ok = true; /* WriteTsf: bare REG_TSFTR (8821AU readback) */
   c.xtal_cap_max = 0x3f; /* 6-bit AFE crystal-cap trim (0x2C) */
   c.xtal_cap_default = _eepromManager->crystal_cap & 0x3f;
@@ -2488,9 +2492,10 @@ void RtlJaguarDevice::Stop() {
   /* A station arm ends with the session: restored before the optional
    * power-down (best effort; a failure is logged by the clear), so a chip
    * left powered (tuning.teardown_power_down=0) does not keep answering for
-   * the station. */
+   * the station. A new arm is refused until the next bring-up. */
   {
     std::lock_guard<std::recursive_mutex> lock(_port0_mu);
+    _station_ready = false;
     if (_station.armed())
       (void)_station.clear(_device, _logger, "Jaguar1");
   }

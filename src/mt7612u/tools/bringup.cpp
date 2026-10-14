@@ -620,7 +620,7 @@ static int gate_beacon(uint8_t chan, int secs)
 	}
 	/* TX-only: beaconing never reads EP 4. */
 	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) {
-		printf("GATE A: FAIL - mac_start\n"); return 1;
+		printf("GATE A: FAIL - mac_start\n"); mt_mac_stop(&dev); return 1;
 	}
 
 	mt_beacon_init(&dev);
@@ -792,7 +792,8 @@ static int gate_ap(uint8_t chan, int secs)
 	}
 	rx_up = 1;
 	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
-		printf("GATE B: FAIL - mac_start\n"); mt7612u_rx_stop(&dev); return 1;
+		printf("GATE B: FAIL - mac_start\n");
+		rx_teardown(); mt_mac_stop(&dev); return 1;
 	}
 	/*
 	 * AP receive filter. The managed default mt_mac_start() just wrote already
@@ -957,7 +958,7 @@ static int gate_tx(uint8_t chan, int count, int phy, int mcs)
 	}
 	/* TX only: this gate never reads EP 4, so do not switch the receiver on. */
 	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) {
-		printf("GATE E: FAIL - mac_start failed\n"); return 1;
+		printf("GATE E: FAIL - mac_start failed\n"); mt_mac_stop(&dev); return 1;
 	}
 	printf("MAC started: MT_MAC_SYS_CTRL=0x%08x (bit2 TX, bit3 RX)\n",
 	       mt_rr(&dev, MT_MAC_SYS_CTRL));
@@ -1014,7 +1015,8 @@ static int gate_rx(uint8_t chan, int want)
 		printf("GATE F: FAIL - set_channel failed\n"); return 1;
 	}
 	if (mt_mac_start(&dev, MT_RX_DRAIN_SYNC)) {
-		printf("GATE F: FAIL - mac_start failed\n"); return 1;
+		printf("GATE F: FAIL - mac_start failed\n");
+		mt_mac_rx_disable(&dev); mt_mac_stop(&dev); return 1;
 	}
 	/* Monitor: drop only CRC and PHY errors, accept everything else. The
 	 * initvals value 0x15f97 drops a great deal more than that. */
@@ -1140,7 +1142,7 @@ static int gate_g(uint8_t chan, int count)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	memset(frame, 0, sizeof frame);
 	frame[0] = 0x08;
@@ -1251,7 +1253,7 @@ static int gate_mtu(uint8_t chan, int count)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	memset(frame, 0, sizeof frame);
 	frame[0] = 0x08;                        /* data, 3-address */
@@ -1339,7 +1341,7 @@ static int gate_soak(uint8_t chan, int secs, int framelen)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	memset(frame, 0, sizeof frame);
 	frame[0] = 0x08;
@@ -1458,7 +1460,9 @@ static int gate_arx(uint8_t chan, int secs, int notick)
 	if (mt7612u_rx_start(&dev, arx_cb, &ctx)) {
 		printf("GATE arx: FAIL - rx_start failed\n"); return 1;
 	}
-	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) { rx_teardown(); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		rx_teardown(); mt_mac_stop(&dev); return 1;
+	}
 	mt7612u_set_monitor_rx(&dev, 0);
 	t0 = now_ms();
 	/* notick is the negative control: without the 1 Hz PHY tick this gate
@@ -1525,7 +1529,9 @@ static int gate_duplex(uint8_t chan, int secs)
 	memcpy(frame + 24, "MT7612U-HAL ", 12);
 
 	if (mt7612u_rx_start(&dev, arx_cb, &ctx)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) { rx_teardown(); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		rx_teardown(); mt_mac_stop(&dev); return 1;
+	}
 	mt7612u_set_monitor_rx(&dev, 0);
 
 	t0 = now_ms();
@@ -1676,7 +1682,7 @@ static int gate_ampdu(uint8_t chan, int count)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	/* A real station-table entry: aggregation is a per-peer notion, and
 	 * wcid 0xff (what the injector normally uses) names no peer. */
@@ -1867,7 +1873,7 @@ static int parse_mac6(const char *s, uint8_t out[6])
  * columns, making a No-Ack arm look as if it retried to exactly the
  * configured limit and displacing one of its own entries from entr/sent.
  * Entries carrying the previous arm's pktid are reported as late; any other
- * pktid as foreign.
+ * pktid as foreign - with one exception, the stale EXT word (txs_drain).
  *
  * Exit: 0 reported, 1 device failure OR no status entry filed at all (the
  * measurement did not happen), 2 bad argument or retry limit refused,
@@ -1877,7 +1883,44 @@ struct txs_sum {
 	long entries, success, retry_total, retry_max;
 	long late_prev; /* entries carrying the PREVIOUS arm's pktid */
 	long foreign;   /* entries with any other pktid */
+	long stale_ext; /* own entries popped with a stale EXT word: counted in
+	                 * entries/success, kept out of the retry columns */
+	unsigned stale_pktid; /* the claimed entry's EXT pktid, and */
+	int stale_ok;         /* its SUCCESS bit - for txs_unclaim() */
 };
+
+/* The claim is a bet that the stale-pktid entry is ours. Two outcomes say
+ * it was not, and both hand it back to the column the drain would have put
+ * it in, so success is not inflated:
+ *  - the arm's own entries reach `sent` anyway (a late entry, or a MAC
+ *    duplicate): one arm read 61/60 with one claimed. txs_unclaim(), at arm
+ *    end. With a duplicate the own count exceeds `sent`, hence >=.
+ *  - the claim was taken while the arm's first transfer was in flight, and
+ *    that transfer then completed in error. Whether any of it reached the
+ *    chip is not known (mt7612u_tx_wire_failed() is an upper bound), but
+ *    the claim rests on the arm having a transfer that completed - this
+ *    one did not, so the entry cannot be attributed to this arm.
+ *    txs_unclaim_one() on that wire failure, while no frame has been
+ *    counted sent. */
+static void txs_unclaim_one(struct txs_sum *o, unsigned prev)
+{
+	if (o->stale_ext != 1)
+		return;
+	o->entries--;
+	if (o->stale_ok)
+		o->success--;
+	o->stale_ext = 0;
+	if (o->stale_pktid == prev)
+		o->late_prev++;
+	else
+		o->foreign++;
+}
+
+static void txs_unclaim(struct txs_sum *o, long sent, unsigned prev)
+{
+	if (o->entries - o->stale_ext >= sent)
+		txs_unclaim_one(o, prev);
+}
 
 /* mt76's skb pktid range starts at MT_PACKET_ID_FIRST (3) and the id must
  * stay under bit 7 (MT_PACKET_ID_HAS_RATE): 3 + 8 * pass + arm gives 3..18
@@ -1887,14 +1930,78 @@ static unsigned txs_arm_pktid(int rx_on, unsigned arm)
 	return 3u + 8u * (unsigned)rx_on + arm;
 }
 #define TXS_NO_PKTID 0x100u   /* matches no 8-bit EXT_PKTID */
+#define TXS_ANY_PKTID 0x200u  /* txs_drain's stale_id: unknown, so any */
 /* Slack on top of frame_budget_ms for one frame's status wait: USB submit
  * latency plus the drain's two control reads. */
 #define TXS_FRAME_MARGIN_MS 50.0
+/* Floor on one frame's status wait. frame_budget_ms is ladder arithmetic from
+ * the 5 GHz measurement (~46 ms for 16 attempts); on ch6 an unacknowledged
+ * frame at limit 15 measured 1.1-1.3 s from status to status, and a wait
+ * shorter than the air submits ahead of it: the chip's queue fills and its
+ * bulk OUT NAKs. A wait that ends early only costs time on the frames that
+ * genuinely lose their status. */
+#define TXS_STATUS_WAIT_MIN_MS 2000.0
+/* Bound on waiting for a submitted transfer to complete. TX transfers carry no
+ * timeout, so one still in flight here is a slow chip, not a failure: it is
+ * counted as sent and left to the status wait - resending it would air the
+ * frame twice. */
+#define TXS_USB_WAIT_MS 1500.0
+
+/*
+ * DEVOURER_TXS_TRACE=1: one "TXS" line per popped status entry (raw main and
+ * EXT words, how it was classified, the frame count at the time), per submit
+ * and per expired per-frame wait, plus every change of the EXT word seen while
+ * the FIFO was EMPTY - which is what says whether an empty FIFO's EXT holds
+ * the last popped entry (the premise of the stale-EXT claim) or something
+ * else. A status read slower than TXS_SLOW_READ_MS is flagged: mt_vendor_req
+ * sleeps 5 ms before a retry, and a retried read of the pop-on-read main word
+ * would lose the entry the first attempt popped. Off by default; written so
+ * the arm table and its parsers are unchanged ("TXS " prefix).
+ */
+#define TXS_SLOW_READ_MS 4.0
+static struct {
+	int on;
+	char arm;
+	int rx_on;
+	long n;            /* frames submitted so far in this arm */
+	uint32_t last_ext; /* last EXT word seen, popped or not */
+	long slow_reads;   /* per arm */
+	double tick_ms, tick_max_ms;   /* per arm: time inside txs_tick */
+} txs_tr;
+
+static void txs_trace_read(uint32_t addr, double ms)
+{
+	if (ms < TXS_SLOW_READ_MS) return;
+	txs_tr.slow_reads++;
+	printf("TXS t=%.1f arm=%c rx=%d n=%ld SLOW-READ %s %.1f ms\n", now_ms(),
+	       txs_tr.arm, txs_tr.rx_on, txs_tr.n,
+	       addr == MT_TX_STAT_FIFO ? "main" : "ext", ms);
+}
 
 /* Returns 0 when the FIFO was drained (or is empty), -1 when a status read
- * failed - the caller must not report the arm as measured then. */
+ * failed - the caller must not report the arm as measured then.
+ *
+ * The EXT-then-main read is two USB transfers, not one atomic read. When the
+ * FIFO is EMPTY at the EXT read and an entry is filed before the main read,
+ * the main read pops that entry but the EXT word read just before it is
+ * stale - it still describes the last entry popped. Within an arm that is
+ * harmless (same pktid). On an arm's FIRST entry it is the previous arm's
+ * pktid (or, on the session's first arm, whatever EXT held), so the entry was
+ * counted late/foreign, the arm stayed one short for good, and every
+ * per-frame wait then timed out - the "one-step status lag" rows of
+ * docs/mt7612u-tx-retry.md (N-1/N, a timeout on every frame, ~5-6 fps, and
+ * the late entry in the SAME arm's row, after a fully settled arm).
+ *
+ * `stale_id` takes that one entry back. It is the pktid a stale EXT word
+ * would carry: the last arm that SENT a frame (an arm that sent none popped
+ * nothing, so EXT still describes the arm before it), or TXS_ANY_PKTID on the
+ * session's first. The caller passes it only once this arm has submitted a
+ * frame and that arm owed no entries, and TXS_NO_PKTID otherwise (no
+ * claim). The arm's first popped entry, carrying stale_id, can then only be
+ * ours. Its main word is fresh, so its SUCCESS bit counts; its retry count is
+ * the stale word's, so it is kept out of the retry columns. */
 static int txs_drain(struct mt7612u_dev *d, struct txs_sum *o,
-                     unsigned want, unsigned prev)
+                     unsigned want, unsigned prev, unsigned stale_id)
 {
 	int guard;
 
@@ -1908,8 +2015,23 @@ static int txs_drain(struct mt7612u_dev *d, struct txs_sum *o,
 		 * (mt76x02_mac_load_tx_status): EXT FIRST, then the main word.
 		 * Reading MT_TX_STAT_FIFO pops the entry, so an EXT read after it
 		 * would describe the NEXT head, not the entry just popped. */
-		if (mt_rr_chk(d, MT_TX_STAT_FIFO_EXT, &ext)) return -1;
-		if (mt_rr_chk(d, MT_TX_STAT_FIFO, &st)) return -1;
+		if (txs_tr.on) {
+			double t = now_ms();
+
+			if (mt_rr_chk(d, MT_TX_STAT_FIFO_EXT, &ext)) return -1;
+			txs_trace_read(MT_TX_STAT_FIFO_EXT, now_ms() - t);
+			t = now_ms();
+			if (mt_rr_chk(d, MT_TX_STAT_FIFO, &st)) return -1;
+			txs_trace_read(MT_TX_STAT_FIFO, now_ms() - t);
+			if (!(st & MT_TX_STAT_FIFO_VALID) && ext != txs_tr.last_ext)
+				printf("TXS t=%.1f arm=%c rx=%d n=%ld EMPTY ext "
+				       "%08x -> %08x\n", now_ms(), txs_tr.arm,
+				       txs_tr.rx_on, txs_tr.n, txs_tr.last_ext, ext);
+			txs_tr.last_ext = ext;
+		} else {
+			if (mt_rr_chk(d, MT_TX_STAT_FIFO_EXT, &ext)) return -1;
+			if (mt_rr_chk(d, MT_TX_STAT_FIFO, &st)) return -1;
+		}
 		if (!(st & MT_TX_STAT_FIFO_VALID)) return 0;
 		/* Only the CURRENT arm's frames are averaged in: the previous
 		 * arm's late status and anything else that files status are
@@ -1917,12 +2039,37 @@ static int txs_drain(struct mt7612u_dev *d, struct txs_sum *o,
 		{
 			const unsigned id =
 				(unsigned)FIELD_GET(MT_TX_STAT_FIFO_EXT_PKTID, ext);
+			const char *cls = "own";
 
 			if (id != want) {
-				if (id == prev) o->late_prev++;
-				else            o->foreign++;
-				continue;
+				if (stale_id != TXS_NO_PKTID && o->entries == 0 &&
+				    (stale_id == TXS_ANY_PKTID || id == stale_id)) {
+					o->entries++;
+					o->stale_ext++;
+					o->stale_pktid = id;
+					o->stale_ok = !!(st & MT_TX_STAT_FIFO_SUCCESS);
+					if (o->stale_ok)
+						o->success++;
+					cls = "stale-claimed";
+				} else if (id == prev) {
+					o->late_prev++;
+					cls = "late";
+				} else {
+					o->foreign++;
+					cls = "foreign";
+				}
 			}
+			if (txs_tr.on)
+				printf("TXS t=%.1f arm=%c rx=%d n=%ld POP st=%08x "
+				       "ext=%08x pktid=%u wcid=%u ok=%d retry=%u "
+				       "%s entries=%ld\n", now_ms(), txs_tr.arm,
+				       txs_tr.rx_on, txs_tr.n, st, ext, id,
+				       (unsigned)FIELD_GET(MT_TX_STAT_FIFO_WCID, st),
+				       !!(st & MT_TX_STAT_FIFO_SUCCESS),
+				       (unsigned)FIELD_GET(MT_TX_STAT_FIFO_EXT_RETRY,
+				                           ext),
+				       cls, o->entries + (id == want));
+			if (id != want) continue;
 		}
 		o->entries++;
 		if (st & MT_TX_STAT_FIFO_SUCCESS) o->success++;
@@ -1933,11 +2080,6 @@ static int txs_drain(struct mt7612u_dev *d, struct txs_sum *o,
 	return 0;
 }
 
-/* DEVOURER_TX_RETRY_LIMIT, read with env_config's strictness: the whole
- * string one number (base auto-detect), trailing whitespace by isspace()
- * exactly as env_long_strict() takes it, clamped to the config's 0..63.
- * Returns 1 and sets *out when present and valid, 0 when unset, -1 when
- * present but not a number. */
 /* The whole string one number (base auto-detect, leading and trailing
  * whitespace allowed, as strtol and isspace define them) - the rule
  * env_config's env_long_strict() applies. 0 and *out on success, -1 when no
@@ -1967,8 +2109,13 @@ static int txs_parse_long(const char *s, long *out)
 static void txs_tick(int rx_on, double *last_tick)
 {
 	if (rx_on && now_ms() - *last_tick >= 1000.0) {
+		const double t = now_ms();
+
 		mt7612u_phy_tick(&dev);
 		*last_tick = now_ms();
+		txs_tr.tick_ms += *last_tick - t;
+		if (*last_tick - t > txs_tr.tick_max_ms)
+			txs_tr.tick_max_ms = *last_tick - t;
 	}
 }
 
@@ -1987,6 +2134,11 @@ static void txs_print_escaped(const char *s)
 	}
 }
 
+/* DEVOURER_TX_RETRY_LIMIT, read with env_config's strictness: the whole
+ * string one number (base auto-detect), trailing whitespace by isspace()
+ * exactly as env_long_strict() takes it, clamped to the config's 0..63.
+ * Returns 1 and sets *out when present and valid, 0 when unset, -1 when
+ * present but not a number. */
 static int txs_retry_limit_env(int *out)
 {
 	const char *e = getenv("DEVOURER_TX_RETRY_LIMIT");
@@ -2009,6 +2161,10 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 	int rx_on, rl = 0, rl_given;
 	long total_entries = 0, total_foreign = 0;
 	unsigned prev_pktid = TXS_NO_PKTID;
+	/* txs_drain's stale_id: the last arm that sent a frame, and whether it
+	 * settled with no entry owed. */
+	unsigned stale_pktid = TXS_ANY_PKTID;
+	int stale_settled = 1;
 	double frame_budget_ms;
 	int io_fail = 0;   /* status read / WCID setup failed: teardown, exit 1 */
 	double last_tick = 0.0;  /* receiver passes: last mt7612u_phy_tick() */
@@ -2057,6 +2213,11 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 	}
 	/* Parsed before any device work, so a typo costs nothing. */
 	rl_given = txs_retry_limit_env(&rl);
+	{
+		const char *tr = getenv("DEVOURER_TXS_TRACE");
+
+		txs_tr.on = tr && *tr && strcmp(tr, "0") != 0;
+	}
 	if (rl_given < 0) {
 		printf("GATE TXS: FAIL - DEVOURER_TX_RETRY_LIMIT='");
 		txs_print_escaped(getenv("DEVOURER_TX_RETRY_LIMIT"));
@@ -2120,7 +2281,10 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 		ctr.acks.store(0);
 		ctr.frames.store(0);
 
-		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+		if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) {
+			mt_mac_stop(&dev);
+			return 1;
+		}
 		if (mt_async_start(&dev, rx_on ? ucast_rx_cb : NULL,
 		                   rx_on ? (void *)&ctr : NULL)) {
 			mt_mac_stop(&dev);
@@ -2155,13 +2319,19 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 
 		for (a = 0; !io_fail && a < sizeof arms / sizeof arms[0]; a++) {
 			struct mt7612u_tx_rate rate = { };
-			struct txs_sum sum = { 0, 0, 0, 0, 0, 0 };
+			struct txs_sum sum = {};
 			const unsigned pktid = txs_arm_pktid(rx_on, a);
 			const uint8_t *sa = arms[a].own_sa ? dev.macaddr : src;
 			const uint8_t *a1 = arms[a].bcast_a1 ? bcast : peer;
 			double t0, wall, send_deadline;
 			long n = 0, attempts = 0, submit_fail = 0;
-			long status_timeouts = 0;
+			long status_timeouts = 0, wire_fail = 0;
+			const double status_wait_ms =
+				frame_budget_ms + TXS_FRAME_MARGIN_MS >
+				TXS_STATUS_WAIT_MIN_MS ?
+				frame_budget_ms + TXS_FRAME_MARGIN_MS :
+				TXS_STATUS_WAIT_MIN_MS;
+			struct mt_async_stats us0, us1;
 			int settled = 0;
 
 			rate.phy = MT7612U_PHY_HT;
@@ -2179,15 +2349,26 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 			memcpy(frame + 26, "MT7612U-TXS", 11);
 
 			/* The previous arm's tail: counted as late, never as ours. */
-			if (txs_drain(&dev, &sum, pktid, prev_pktid)) io_fail = 1;
+			txs_tr.arm = arms[a].tag;
+			txs_tr.rx_on = rx_on;
+			txs_tr.n = 0;
+			txs_tr.slow_reads = 0;
+			txs_tr.tick_ms = txs_tr.tick_max_ms = 0.0;
+			if (txs_drain(&dev, &sum, pktid, prev_pktid, TXS_NO_PKTID))
+				io_fail = 1;
+			/* After the previous arm's tail: this arm's USB delta.
+			 * us1 tracks the error count frame by frame. */
+			mt_async_stats(&dev, &us0);
+			us1 = us0;
 
 			/* Bounded twice, like gate_ampdu's wall clock: a submit
 			 * that keeps failing must end the arm, not spin it. The
 			 * attempt cap allows 3 failures per frame; the clock
-			 * allows every frame its full per-frame status wait. */
+			 * allows every frame its transfer and its full status
+			 * wait. */
 			t0 = now_ms();
-			send_deadline = t0 + frames * (frame_budget_ms +
-			                               TXS_FRAME_MARGIN_MS) + 5000.0;
+			send_deadline = t0 + frames * (TXS_USB_WAIT_MS +
+			                               status_wait_ms) + 5000.0;
 			while (n < frames && attempts < (long)frames * 4 &&
 			       now_ms() < send_deadline && !g_stop && !io_fail) {
 				frame[22] = (uint8_t)((n & 0xf) << 4);
@@ -2198,11 +2379,70 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 				              MT_TXOPT_TXS | MT_TXOPT_PKTID(pktid) |
 				              arms[a].opts) != 0) {
 					submit_fail++;
-					if (txs_drain(&dev, &sum, pktid, prev_pktid))
+					/* A refused libusb submit bumps tx_err; re-baseline
+					 * so the next frame does not read it as its own wire
+					 * failure. */
+					mt_async_stats(&dev, &us1);
+					if (txs_drain(&dev, &sum, pktid, prev_pktid,
+					              n > 0 && stale_settled ?
+					              stale_pktid : TXS_NO_PKTID))
 						io_fail = 1;
 					continue;
 				}
+				/*
+				 * Sent means ON THE CHIP, not queued in libusb: wait
+				 * for this transfer to resolve. One that failed put no
+				 * frame on the air and can file no status - it is
+				 * retried like a refused submit, never counted as
+				 * sent.
+				 */
+				{
+					const double udl = now_ms() + TXS_USB_WAIT_MS;
+					struct mt_async_stats u;
+
+					for (;;) {
+						mt_async_stats(&dev, &u);
+						if (u.tx_inflight == 0 || now_ms() >= udl ||
+						    g_stop)
+							break;
+						/* This frame is submitted: the arm has
+						 * sent, so the stale-EXT claim applies. */
+						if (txs_drain(&dev, &sum, pktid, prev_pktid,
+						              stale_settled ? stale_pktid
+						                            : TXS_NO_PKTID)) {
+							io_fail = 1;
+							break;
+						}
+						txs_tick(rx_on, &last_tick);
+						mt_usleep(500);
+					}
+					if (io_fail) break;
+					if (u.tx_err != us1.tx_err) {
+						us1 = u;
+						wire_fail++;
+						/* A claim taken while this, the
+						 * arm's first, transfer was in
+						 * flight cannot be attributed to
+						 * the arm: that transfer did not
+						 * complete (txs_unclaim_one). */
+						if (n == 0)
+							txs_unclaim_one(&sum,
+							                prev_pktid);
+						if (txs_tr.on)
+							printf("TXS t=%.1f arm=%c rx=%d n=%ld "
+							       "WIRE-FAIL inflight=%d\n",
+							       now_ms(), arms[a].tag, rx_on,
+							       n, u.tx_inflight);
+						continue;
+					}
+					us1 = u;
+				}
 				n++;
+				txs_tr.n = n;
+				if (txs_tr.on)
+					printf("TXS t=%.1f arm=%c rx=%d n=%ld SUBMIT "
+					       "entries=%ld\n", now_ms(), arms[a].tag,
+					       rx_on, n, sum.entries);
 				/*
 				 * One frame at a time, for real. mt_tx_raw returns
 				 * once the USB transfer is SUBMITTED (the async
@@ -2210,8 +2450,9 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 				 * without this wait submissions run ahead of the
 				 * air and can overflow the shallow status FIFO
 				 * between drains - entries lost for good. Wait for
-				 * this frame's own entry, bounded by the ladder at
-				 * the effective limit; on expiry count a status
+				 * this frame's own entry, bounded by status_wait_ms
+				 * (the ladder at the effective limit, floored at
+				 * TXS_STATUS_WAIT_MIN_MS); on expiry count a status
 				 * timeout and go on. (If one entry never arrives,
 				 * every later frame of the arm also waits its full
 				 * bound - the count then says how many frames were
@@ -2219,12 +2460,13 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 				 * missing.)
 				 */
 				{
-					const double fdl = now_ms() + frame_budget_ms +
-					                   TXS_FRAME_MARGIN_MS;
+					const double fdl = now_ms() + status_wait_ms;
 
 					do {
 						if (txs_drain(&dev, &sum, pktid,
-						              prev_pktid)) {
+						              prev_pktid,
+						              stale_settled ? stale_pktid
+						                            : TXS_NO_PKTID)) {
 							io_fail = 1;
 							break;
 						}
@@ -2232,8 +2474,15 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 						txs_tick(rx_on, &last_tick);
 						mt_usleep(500);
 					} while (now_ms() < fdl && !g_stop);
-					if (!io_fail && sum.entries < n)
+					if (!io_fail && sum.entries < n) {
 						status_timeouts++;
+						if (txs_tr.on)
+							printf("TXS t=%.1f arm=%c rx=%d "
+							       "n=%ld WAIT-EXPIRED "
+							       "entries=%ld\n", now_ms(),
+							       arms[a].tag, rx_on, n,
+							       sum.entries);
+					}
 				}
 			}
 			/*
@@ -2246,20 +2495,29 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 			 *
 			 * Bounded by the worst case that matters: `frames` at
 			 * the full ladder for the effective retry limit
-			 * (frame_budget_ms), plus slack.
+			 * (frame_budget_ms), and never less than one frame's
+			 * status wait, plus slack.
 			 */
 			{
-				double deadline = now_ms() + frames * frame_budget_ms +
-				                  2000.0;
+				double deadline = now_ms() + 2000.0 +
+					(frames * frame_budget_ms > status_wait_ms ?
+					 frames * frame_budget_ms : status_wait_ms);
 
 				while (sum.entries < n && now_ms() < deadline
 				       && !g_stop && !io_fail) {
 					txs_tick(rx_on, &last_tick);
 					mt_usleep(2000);
-					if (txs_drain(&dev, &sum, pktid, prev_pktid))
+					if (txs_drain(&dev, &sum, pktid, prev_pktid,
+					              n > 0 && stale_settled ?
+					              stale_pktid : TXS_NO_PKTID))
 						io_fail = 1;
 				}
-				settled = (sum.entries >= n);
+				/* An arm cut short (attempt cap, wall clock) did not
+				 * send what it was asked to: never settled, so a short
+				 * arm whose few frames all filed status cannot read as
+				 * a clean row. */
+				txs_unclaim(&sum, n, prev_pktid);
+				settled = (sum.entries >= n && n == frames);
 			}
 			wall = now_ms() - t0;
 
@@ -2273,22 +2531,66 @@ static int gate_txs(uint8_t chan, int frames, const char *peer_str)
 			 * entries, uncapped: more than `sent` would mean the MAC
 			 * filed duplicates, and is shown as such rather than
 			 * clipped. */
-			printf("  %c    %-28s %7.0f %4ld/%-4ld %8ld %9.1f %6ld%s\n",
-			       arms[a].tag, arms[a].what, n * 1000.0 / wall,
-			       sum.entries, n, sum.success,
-			       sum.entries ? (double)sum.retry_total / sum.entries : 0.0,
-			       sum.retry_max, settled ? "" : "  UNSETTLED");
+			{
+				/* The retry mean is over the entries whose EXT
+				 * word is their own. */
+				const long rtry_n = sum.entries - sum.stale_ext;
+
+				printf("  %c    %-28s %7.0f %4ld/%-4ld %8ld %9.1f %6ld%s\n",
+				       arms[a].tag, arms[a].what, n * 1000.0 / wall,
+				       sum.entries, n, sum.success,
+				       rtry_n ? (double)sum.retry_total / rtry_n : 0.0,
+				       sum.retry_max, settled ? "" : "  UNSETTLED");
+			}
+			if (wire_fail)
+				printf("       (pktid %u: %ld transfers failed on the "
+				       "wire and were resent - not counted as sent)\n",
+				       pktid, wire_fail);
 			if (submit_fail || status_timeouts || sum.late_prev ||
-			    sum.foreign || n < frames)
+			    sum.foreign || sum.stale_ext || n < frames)
 				printf("       (pktid %u: %ld submit failures, %ld/%d "
 				       "frames sent, %ld per-frame status timeouts, "
 				       "%ld late entries from the previous arm, "
-				       "%ld foreign)\n",
+				       "%ld foreign, %ld stale-EXT entries claimed)\n",
 				       pktid, submit_fail, n, frames, status_timeouts,
-				       sum.late_prev, sum.foreign);
+				       sum.late_prev, sum.foreign, sum.stale_ext);
+			/* "sent" counts SUBMITTED bulk transfers. One that then
+			 * failed or never completed put no frame on the air and
+			 * can file no status, so it is named here rather than
+			 * left to read as a lost status entry. */
+			mt_async_stats(&dev, &us1);
+			if (us1.tx_done - us0.tx_done != (uint64_t)n ||
+			    us1.tx_err != us0.tx_err)
+				printf("       (USB: %llu submitted, %llu completed, "
+				       "%llu errors this arm, against %ld sent)\n",
+				       (unsigned long long)(us1.tx_submitted -
+				                            us0.tx_submitted),
+				       (unsigned long long)(us1.tx_done - us0.tx_done),
+				       (unsigned long long)(us1.tx_err - us0.tx_err),
+				       n);
+			if (txs_tr.on)
+				printf("TXS arm=%c rx=%d SUMMARY sent=%ld entries=%ld "
+				       "late=%ld foreign=%ld stale=%ld timeouts=%ld "
+				       "submit_fail=%ld slow_reads=%ld tick_ms=%.0f "
+				       "tick_max_ms=%.0f wall_ms=%.0f\n",
+				       arms[a].tag, rx_on, n, sum.entries,
+				       sum.late_prev, sum.foreign, sum.stale_ext,
+				       status_timeouts, submit_fail, txs_tr.slow_reads,
+				       txs_tr.tick_ms, txs_tr.tick_max_ms, wall);
 			total_entries += sum.entries;
 			total_foreign += sum.foreign + sum.late_prev;
 			prev_pktid = pktid;
+			/* More entries than frames would be MAC duplicates: then a
+			 * stale-pktid entry is not provably ours either. An arm that
+			 * sent nothing popped nothing and leaves both as they were.
+			 * Read AFTER txs_unclaim() on purpose: an arm whose own
+			 * entries reached n, with one surplus claim handed back,
+			 * owes nothing and counts as settled, so the next arm may
+			 * claim; a duplicate keeps own > n and still disarms it. */
+			if (n > 0) {
+				stale_pktid = pktid;
+				stale_settled = (sum.entries == n);
+			}
 			if (io_fail) {
 				printf("       (arm %c: a status-FIFO read FAILED - "
 				       "the row above is incomplete)\n", arms[a].tag);
@@ -2365,7 +2667,9 @@ static int gate_caps(uint8_t chan)
 	 * with nothing reading, that is long enough to wedge the part below
 	 * the USB level, which no software reset recovers. */
 	if (mt_async_start(&dev, drain_cb, &drained)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) { rx_teardown(); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		rx_teardown(); mt_mac_stop(&dev); return 1;
+	}
 
 	mt7612u_get_caps(&dev, &c);
 	printf("caps: %s rev 0x%08x  %dTx%dRx  bw_mask 0x%02x (20%s%s)\n",
@@ -2537,7 +2841,9 @@ static int gate_ack(uint8_t chan, int secs, int arm)
 	/* Ring first, receiver second - see gate_caps. Arming the responder and
 	 * printing between the two would otherwise leave RX on and undrained. */
 	if (mt7612u_rx_start(&dev, ack_cb, &off)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) { rx_teardown(); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		rx_teardown(); mt_mac_stop(&dev); return 1;
+	}
 	/* CRC and PHY errors only: DUP must stay clear so retries reach us. */
 	mt_wr(&dev, MT_RX_FILTR_CFG,
 	      MT_RX_FILTR_CFG_CRC_ERR | MT_RX_FILTR_CFG_PHY_ERR);
@@ -2661,7 +2967,9 @@ static int gate_rxbytes(uint8_t chan, int secs)
     if (mt_init_hardware(&dev, NULL)) return 1;
     if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
     if (mt7612u_rx_start(&dev, rxbytes_cb, NULL)) return 1;
-    if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) { rx_teardown(); return 1; }
+    if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+        rx_teardown(); mt_mac_stop(&dev); return 1;
+    }
     mt7612u_set_monitor_rx(&dev, 0);
     mt7612u_link_stats_start(&dev);
 
@@ -2741,7 +3049,11 @@ static int gate_linkstat(uint8_t chan, int secs, int with_rx)
 	if (with_rx) {
 		if (mt7612u_rx_start(&dev, drain_cb, &linkstat_drained)) return 1;
 	}
-	if (mt_mac_start(&dev, with_rx)) { if (with_rx) rx_teardown(); return 1; }
+	if (mt_mac_start(&dev, with_rx)) {
+		if (with_rx) rx_teardown();
+		mt_mac_stop(&dev);
+		return 1;
+	}
 	if (with_rx) mt7612u_set_monitor_rx(&dev, 0);
 	mt7612u_link_stats_start(&dev);
 
@@ -2815,7 +3127,7 @@ static int gate_linktx(uint8_t chan, int count)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	memset(f, 0, sizeof f);
 	f[0] = 0x08;
@@ -2904,7 +3216,9 @@ static int gate_linkrx(uint8_t chan, int secs)
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
 	if (mt7612u_rx_start(&dev, linkrx_cb, NULL)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) { rx_teardown(); return 1; }
+	if (mt_mac_start(&dev, MT_RX_DRAIN_RING)) {
+		rx_teardown(); mt_mac_stop(&dev); return 1;
+	}
 	mt7612u_set_monitor_rx(&dev, 0);
 
 	printf("RX on ch%u for %d s, filtering our own magic\n", chan, secs);
@@ -2978,7 +3292,7 @@ static int gate_diversity(uint8_t chan, int count)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	memset(f, 0, sizeof f);
 	f[0] = 0x08;
@@ -3082,7 +3396,7 @@ static int gate_coding(uint8_t chan, int count, int bw)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, (enum mt7612u_bw)bw)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	mt_chan_group(chan, (uint8_t)bw, &hw_chan, NULL, NULL);
 	printf("ch%u (hw centre %u) at %d MHz, %d frames per arm\n\n",
@@ -3189,7 +3503,7 @@ static int gate_sweep(uint8_t chan, int count, int bw)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, (enum mt7612u_bw)bw)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	/* Report the centre the hardware actually tuned, not the control
 	 * channel: at 80 MHz they differ by up to 6, and a witness listening on
@@ -3318,7 +3632,7 @@ static int gate_vht(uint8_t chan, int count, int bw)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, (enum mt7612u_bw)bw)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	mt_chan_group(chan, (uint8_t)bw, &hw_chan, NULL, NULL);
 	printf("chainmask 0x%04x -> %d spatial streams, txwi[17]=0x%02x\n",
@@ -3400,7 +3714,7 @@ static int gate_rtap(uint8_t chan, int count)
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
 	if (mt_set_channel(&dev, chan, MT7612U_BW_20)) return 1;
-	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) return 1;
+	if (mt_mac_start(&dev, MT_RX_DRAIN_NONE)) { mt_mac_stop(&dev); return 1; }
 
 	memcpy(pkt, rtap, sizeof rtap);
 	{
@@ -4201,9 +4515,10 @@ static int gate_tsfwrap(int gap, int wrap_bits, double max_min)
  * base matters, not what mt76 would program.
  *
  * The receive filter is what makes this a question at all. The managed value
- * mt_mac_start() programs, 0x00015f97, has bit 2 (PROMISC) SET, and in mt76
- * bit 2 is the one mapped to FIF_OTHER_BSS (init.cpp describes that value as
- * dropping other-BSS frames). Bit 3 (OTHER_BSS) is clear. Do not reason about
+ * mt_mac_start() programs, 0x00015f97, has bit 2 (PROMISC) SET - mt76x2
+ * sets it whenever the phy is not in monitor mode, and it drops unicast not
+ * addressed to MT_MAC_ADDR (mt76x2u_config()). Bit 3 (OTHER_BSS) is clear
+ * (regs.h has the full decode). Do not reason about
  * this register from one bit: the gate prints the full value per arm for the
  * reader, and flags an arm whose PROMISC drop bit is clear (the monitor
  * filter).
@@ -4963,11 +5278,12 @@ static int gate_staack(uint8_t chan, int secs, const char *bssid_str)
  *   bringup staid
  */
 /*
- * Every register a station identity could plausibly write: the port identity
- * (MT_MAC_ADDR), the MBSS base (MT_MAC_BSSID) and both words of all eight APC
- * slots. The seam's defining property is that it writes none of them;
- * gate_staid compares a snapshot before and after. Returns -1 on any failed
- * read - an unreadable register cannot be shown unchanged.
+ * Every identity register a station identity could plausibly write: the port
+ * identity (MT_MAC_ADDR), the MBSS base (MT_MAC_BSSID) and both words of all
+ * eight APC slots. The seam writes none of them; gate_staid compares a
+ * snapshot before and after. Returns -1 on any failed read - an unreadable
+ * register cannot be shown unchanged. The one register it DOES write, the
+ * receive filter, is checked separately (staid_filtr_is).
  */
 struct staid_regs { uint32_t w[20]; };
 
@@ -4988,6 +5304,17 @@ static int staid_snapshot(struct staid_regs *r)
 	return 0;
 }
 
+/* 1 when MT_RX_FILTR_CFG reads back as `want`. */
+static int staid_filtr_is(uint32_t want)
+{
+	uint32_t v = 0;
+
+	if (mt_rr_chk(&dev, MT_RX_FILTR_CFG, &v)) return 0;
+	if (v != want)
+		printf("        (MT_RX_FILTR_CFG = %08x, expected %08x)\n", v, want);
+	return v == want;
+}
+
 /* 1 when both snapshots were taken and are identical. */
 static int staid_unchanged(const struct staid_regs *a, int a_ok,
                            const struct staid_regs *b, int b_ok)
@@ -5004,8 +5331,13 @@ static int gate_staid(void)
 	int pass = 0, fail = 0, snap0_ok, snap1_ok;
 	struct staid_regs snap0, snap1;
 
+	/* The monitor filter Mt7612uRadio's RX loop installs - the pre-arm
+	 * state every filter check below is measured against. */
+	const uint32_t mon = MT_RX_FILTR_CFG_CRC_ERR | MT_RX_FILTR_CFG_PHY_ERR;
+
 	if (mt_eeprom_init(&dev)) return 1;
 	if (mt_init_hardware(&dev, NULL)) return 1;
+	mt7612u_set_monitor_rx(&dev, 0);
 
 	memcpy(own, dev.macaddr, 6);
 	printf("=== GATE STAID: the SetStationIdentity contract on hardware ===\n");
@@ -5019,8 +5351,10 @@ static int gate_staid(void)
 	} while (0)
 
 	/* 1. the ordinary case - and the seam's defining property: arming
-	 * writes nothing (MT_MAC_ADDR, MT_MAC_BSSID and all eight APC slots
-	 * read the same before and after). */
+	 * writes no identity register (MT_MAC_ADDR, MT_MAC_BSSID and all eight
+	 * APC slots read the same before and after), and installs the managed
+	 * receive filter in place of the monitor one. */
+	CHK(staid_filtr_is(mon), "pre-arm: the monitor receive filter");
 	snap0_ok = staid_snapshot(&snap0) == 0;
 	CHK(mt7612u_set_station_identity(&dev, own, bssid) == 0,
 	    "arms with the factory address as own");
@@ -5028,8 +5362,16 @@ static int gate_staid(void)
 	CHK(mt7612u_station_bssid(&dev, got) == 0 && memcmp(got, bssid, 6) == 0,
 	    "records the BSSID it was given");
 	CHK(staid_unchanged(&snap0, snap0_ok, &snap1, snap1_ok),
-	    "arming writes no register (MT_MAC_ADDR, MT_MAC_BSSID, APC slots "
-	    "read back unchanged)");
+	    "arming writes no identity register (MT_MAC_ADDR, MT_MAC_BSSID, "
+	    "APC slots read back unchanged)");
+	CHK(staid_filtr_is(MT_RX_FILTR_CFG_MANAGED),
+	    "arming installs the managed receive filter 00015f97");
+
+	/* 1b. a receiver (re)started under the arm: the monitor request is
+	 * recorded, not installed. */
+	mt7612u_set_monitor_rx(&dev, 0);
+	CHK(staid_filtr_is(MT_RX_FILTR_CFG_MANAGED),
+	    "a monitor-filter request while armed keeps the managed filter");
 
 	/* 2. an address this MAC is not holding */
 	CHK(mt7612u_set_station_identity(&dev, foreign, bssid) != 0,
@@ -5047,14 +5389,25 @@ static int gate_staid(void)
 	CHK(mt7612u_set_station_identity(&dev, own, own) != 0,
 	    "refuses own == bssid");
 
-	/* 4. clear - which also writes nothing */
+	CHK(staid_filtr_is(MT_RX_FILTR_CFG_MANAGED),
+	    "the refusals left the (still armed) managed filter alone");
+
+	/* 4. clear - no identity register; the monitor filter back */
 	snap0_ok = staid_snapshot(&snap0) == 0;
-	mt7612u_clear_station_identity(&dev);
+	CHK(mt7612u_clear_station_identity(&dev) == 0,
+	    "clear reports the pre-arm filter restored");
 	snap1_ok = staid_snapshot(&snap1) == 0;
 	CHK(mt7612u_station_bssid(&dev, got) != 0,
 	    "reports no BSSID once cleared");
 	CHK(staid_unchanged(&snap0, snap0_ok, &snap1, snap1_ok),
-	    "clearing writes no register (same registers read back unchanged)");
+	    "clearing writes no identity register (same registers read back "
+	    "unchanged)");
+	CHK(staid_filtr_is(mon), "clearing restores the monitor receive filter");
+
+	/* 4b. a refusal with nothing armed writes no filter either. */
+	CHK(mt7612u_set_station_identity(&dev, foreign, bssid) != 0 &&
+	    staid_filtr_is(mon),
+	    "a refused arm leaves the monitor filter untouched");
 
 	/*
 	 * 5. THE ONE THAT MATTERS. Arm an ACK responder on a foreign address -
@@ -5071,7 +5424,8 @@ static int gate_staid(void)
 		printf("  SKIP  could not arm an ACK responder - case 5 not run\n");
 		fail++;   /* the most important case did not run; do not pass. */
 	}
-	mt7612u_clear_station_identity(&dev);
+	CHK(mt7612u_clear_station_identity(&dev) == 0 && staid_filtr_is(mon),
+	    "clear after case 5 restores the monitor receive filter");
 
 	/*
 	 * 6. THE OTHER ORDERING, the one a real caller is likelier to hit. Case
@@ -5088,12 +5442,37 @@ static int gate_staid(void)
 	    mt7612u_set_ack_responder(&dev, foreign) == 0) {
 		CHK(mt7612u_station_bssid(&dev, got) != 0,
 		    "drops the armed station when a responder takes the identity");
+		CHK(staid_filtr_is(mon),
+		    "the drop gives the receiver back the monitor filter");
 		mt7612u_clear_ack_responder(&dev);
+		/* After a drop the clear re-writes the pre-arm filter and verifies
+		 * it. The drop has already written that value, so a clear that
+		 * wrote nothing would pass a bare read-back: poison the register
+		 * first, so only a clear that writes it can pass - and only once the
+		 * poison reads back, or the check would prove nothing. */
+		mt_wr(&dev, MT_RX_FILTR_CFG, MT_RX_FILTR_CFG_MANAGED);
+		if (staid_filtr_is(MT_RX_FILTR_CFG_MANAGED)) {
+			CHK(mt7612u_clear_station_identity(&dev) == 0 &&
+			    staid_filtr_is(mon),
+			    "clear after the drop re-writes the monitor receive "
+			    "filter (register poisoned first)");
+		} else {
+			printf("  SKIP  the poison write did not read back - the "
+			       "clear-after-drop check would prove nothing\n");
+			fail++;
+			mt7612u_clear_station_identity(&dev);
+		}
+		/* Stop() does not clear (master's), so a clear that missed is
+		 * retried here, once, and a second miss is said. */
+		if (!staid_filtr_is(mon) &&
+		    mt7612u_clear_station_identity(&dev) != 0)
+			printf("  NOTE  a second clear missed too - the receive "
+			       "filter is left as read above\n");
 	} else {
 		printf("  SKIP  could not set up case 6\n");
 		fail++;
+		mt7612u_clear_station_identity(&dev);
 	}
-	mt7612u_clear_station_identity(&dev);
 
 #undef CHK
 	printf("\nGATE STAID: %d passed, %d failed\n", pass, fail);
@@ -5577,7 +5956,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "       bringup tsfwrap [gap 1|2] [wrap_bits] [max_min]  (TSF read across the low-word wrap, ~72 min; rc 3 = no verdict, re-run)\n");
 		fprintf(stderr, "       bringup beacon [chan] [secs]   (Stage A: static AP beacon on air)\n");
 		fprintf(stderr, "       bringup ap     [chan] [secs]   (Stage B: beacon + RX, probe/auth/assoc)\n");
-		fprintf(stderr, "       bringup txs    [chan] [frames] [peer MAC]  (per-frame retry count off MT_TX_STAT_FIFO; honours DEVOURER_TX_RETRY_LIMIT)\n");
+		fprintf(stderr, "       bringup txs    [chan] [frames] [peer MAC]  (per-frame retry count off MT_TX_STAT_FIFO; honours DEVOURER_TX_RETRY_LIMIT; DEVOURER_TXS_TRACE=1 logs every status pop)\n");
 		fprintf(stderr, "       bringup staid                  (the SetStationIdentity contract on hardware, no AP)\n");
 		fprintf(stderr, "       bringup sta    [chan] [secs] <ap-bssid>  (what the BSSID registers do for a managed station)\n");
 		fprintf(stderr, "       bringup staack [chan] [secs] <ap-bssid>  (probe-response retry count; register state, not a verdict)\n");

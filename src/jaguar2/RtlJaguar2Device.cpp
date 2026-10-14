@@ -711,9 +711,9 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * C2H pkt 0xFF/0x0F carries per-frame delivery + retry count —
          * decode + emit tx.report (src/TxReport.h). */
         if (is_c2h && devourer::is_ccx_halmac(f.frame, f.frame_len))
-          devourer::emit_tx_report(
-              _logger->events(),
-              devourer::parse_ccx_halmac(f.frame, f.frame_len), "halmac");
+          DeliverTxReport(_logger->events(),
+                          devourer::parse_ccx_halmac(f.frame, f.frame_len),
+                          "halmac");
         /* Per-frame RSSI/SNR/EVM from the jgr2 PHY-status (present when
          * APP_PHYSTS is on, i.e. drvinfo carries the 32-byte report). CCK rates
          * (DESC_RATE1M..11M = 0..3) use type0, everything else type1. C2H has no
@@ -1356,6 +1356,9 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
   c.station_mode_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.hw_rx_timestamp = true;  /* FrameParserJaguar2 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
+  /* Measured on the 8822B die only (an 8812BU: injected 0x50/0x80 stamped,
+   * 34 µs spread); the 8821C runs the same code with no cell. */
+  c.hw_injected_mgmt_txtsf = _variant == jaguar2::ChipVariant::C8822B;
   c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822B readback) */
   c.xtal_cap_max = 0x3f; /* 6-bit AFE crystal-cap trim (0x24/0x28) */
   c.xtal_cap_default = _hal.efuse_logical_byte(0xB9) == 0xFF
@@ -2326,9 +2329,11 @@ void RtlJaguar2Device::Stop() {
   /* This Stop leaves the chip powered, so a station arm would outlive the
    * session: port 0 on MACID = own / Infra keeps acknowledging for the
    * station after the process has gone. Clear it here (best effort; a
-   * failure is logged by the clear). */
+   * failure is logged by the clear). A new arm is refused until the next
+   * bring-up. */
   {
     std::lock_guard<std::mutex> lk(_reg_mu);
+    _station_ready = false;
     if (_station.armed())
       (void)_station.clear(_device, _logger, "Jaguar2");
   }

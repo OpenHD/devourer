@@ -267,16 +267,11 @@ struct AdapterCaps {
    *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
    *     and hardware key lookup are untested;
    *   - those cells did not drive SetStationIdentity itself. On this part the
-   *     seam writes no register, so the measured hardware state is the state
-   *     a successful arm leaves behind, but the literal "arm through IRadio,
+   *     seam writes no identity register and installs the managed receive
+   *     filter the cells ran (0x00015f97; the RX loop's monitor filter comes
+   *     back on clear), so the measured hardware state is the state a
+   *     successful arm leaves behind, but the literal "arm through IRadio,
    *     then measure" path is not what the cells ran;
-   *   - the cells ran the MANAGED receive filter, and the library's own RX
-   *     path does not: Mt7612uRadio::StartRxLoop calls
-   *     mt7612u_set_monitor_rx() unconditionally, so a station driven through
-   *     IRadio runs PROMISCUOUS. Acknowledgement does not depend on it (a
-   *     monitor-filter run of the same auto-ACK cell also read 100%), but the
-   *     "moving the port identity makes a station deaf" half of the rationale
-   *     is specific to the managed filter;
    *   - two units, one peer model, one channel, near field, no soak; the
    *     second unit reproduced the acknowledgement and uplink cells (its
    *     uplink at 1.9 mean retries against the first unit's 0.0), not the
@@ -418,12 +413,42 @@ struct AdapterCaps {
    * (both word orders, no beacon armed), which is exactly what the Jaguar1
    * WriteTsf writes; the override itself has not run on Jaguar1 hardware. The
    * 8812A/8814A, 8821C (USB and PCIe) and 8822E ride the same pair and code
-   * path and are not separately measured. FALSE on the MT7612U (measured: its DW0/DW1 registers
-   * do not load the counter, docs/mt7612u.md), and on Kestrel and the RTL8733B
-   * (no TSF write in the source — not a bench fact). */
+   * path and are not separately measured. Kestrel: true over PCIe (RTL8852CE,
+   * readback against the FREERUN counter: +30000 µs -> +29998), false over USB
+   * (unmeasured). FALSE on the MT7612U (measured: its DW0/DW1 registers
+   * do not load the counter, docs/mt7612u.md), and on the RTL8733B (no TSF
+   * write in the source — not a bench fact).
+   *
+   * tbtt_follows_tsf: an active hardware beacon's TBTT moves with a WriteTsf
+   * (the TBTT is hardware-locked to the TSF grid), so disciplining the TSF
+   * steers the beacon — the actuator tests/pcie_ptp_tsf_discipline.cpp needs.
+   * Measured on air through WriteTsf on the RTL8852CE (Kestrel, PCIe). FALSE on
+   * Jaguar2/3, whose TBTT is deaf to a TSF write (measured — use
+   * PinBeaconTbtt there), and left false on Jaguar1: its TBTT is recorded as
+   * TSF-locked from the PinBeaconTbtt bench, but not measured through
+   * WriteTsf.
+   *
+   * hw_injected_mgmt_txtsf: the MAC ALSO overwrites the timestamp field of a
+   * management frame the HOST injects through send_packet (a probe response or
+   * a beacon-shaped frame) with its live egress TSF, so a caller can air an
+   * egress-stamped frame on any channel at any time without the hardware
+   * beacon function. Measured with a constant in the field and an independent
+   * witness reading it back (tests/probe_resp_egress_tsf_check.sh): true on
+   * the Jaguar2 8822B die (8812BU), Jaguar3 (8812CU, 8812EU) and the Kestrel
+   * 8852C die (8832CU), both FC 0x50 and 0x80, arrival−egress spread 34–41 µs
+   * over 15 s; the 8821C and 8852B dies are unmeasured and stay false. FALSE
+   * on Jaguar1:
+   * the 8821AU rewrites the field, but with a free-running counter that is
+   * neither TSF port (both read live during the run) and repeats for ~7
+   * frames at a time; its hardware TBTT beacon IS stamped (3.2 µs spread), so
+   * on this family the egress pair rides StartBeacon. The 8812AU/8814AU are
+   * unmeasured and inherit false. False on the RTL8733B (no TSF read, no
+   * beacon) and the MT7612U (unmeasured). */
   bool hw_rx_timestamp = false;
   bool hw_beacon_txtsf = false;
+  bool hw_injected_mgmt_txtsf = false;
   bool tsf_write_ok = false;
+  bool tbtt_follows_tsf = false;
   /* 802.11ax scheduled UL (Kestrel/RTL8852 only). trigger_ul_ok: the adapter
    * can air an HE Trigger frame (UL-OFDMA grant) and program the fw UL-OFDMA
    * scheduler (SendTrigger / ConfigureUlOfdma). twt_ok: the fw exposes the TWT

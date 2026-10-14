@@ -13,6 +13,9 @@
 #include "RxQuality.h"
 #include "SelectedChannel.h"
 #include "ThermalStatus.h"
+#include "TxReport.h"
+#include <condition_variable>
+#include <mutex>
 #include "Sounding.h"
 #include "TriggerTwt.h"
 #include "TxCaps.h"
@@ -263,8 +266,9 @@ public:
    *
    * ORDERING. Call after the RX loop is running, not before. This is not a
    * style preference: a backend may program the receive filter when the RX
-   * loop starts and overwrite anything an earlier call wrote (MT7612U does
-   * exactly this - see Mt7612uRadio::StartRxLoop). An implementation that
+   * loop starts and overwrite anything an earlier call wrote (MT7612U's RX
+   * loop start rewrites the filter, though it keeps an armed station's - see
+   * Mt7612uRadio::SetStationIdentity). An implementation that
    * cannot detect being called too early must say so at its declaration;
    * one that can should refuse and log rather than arm something that will
    * be silently undone.
@@ -473,7 +477,8 @@ public:
    * air-time — a separate per-port timer drives the TBTT (bench-proven). On
    * Jaguar1 the TBTT is recorded as hardware-locked to the TSF grid
    * (PinBeaconTbtt, bench on all three dies), so expect a write there to move
-   * an active beacon's TBTT with it; neither that nor whether the beacon keeps
+   * an active beacon's TBTT with it — on Kestrel over PCIe that is measured on
+   * air (the TBTT follows the write within one beacon); neither that nor whether the beacon keeps
    * airing without the steer's re-download was measured through this call. To
    * steer the hardware-timed beacon (the uplink timing-advance actuator) use
    * AdjustBeaconTiming.
@@ -635,7 +640,10 @@ public:
    * Jaguar1 — offset 0 only (arm/re-derive): its TBTT is hardware-locked to
    * the TSF grid, so a nonzero TSF-preserving pin cannot hold (refused); the
    * flip side is that steering/disciplining the J1 TSF steers the TBTT with
-   * it in hardware, no actuator needed. Base is a no-op. */
+   * it in hardware, no actuator needed. Kestrel (RTL8852CE, PCIe) — the same
+   * model, measured on air: offset 0 is the native state, nonzero refused;
+   * discipline via WriteTsf (tests/pcie_ptp_tsf_discipline.cpp). Base is a
+   * no-op. */
   virtual int32_t PinBeaconTbtt(int32_t offset_us) {
     (void)offset_us;
     return 0;
@@ -654,6 +662,22 @@ public:
    * silently go on-air at 1 Mbps. */
   virtual void SetTxMode(const devourer::TxMode & /*mode*/) {}
   virtual void ClearTxMode() {}
+
+  /* Per-frame CCX TX reports (TxReport.h, DeviceConfig tx.report) handed to
+   * the caller as they decode, in addition to the `tx.report` event. The sink
+   * runs on whichever thread drains C2H for this generation (the RX worker,
+   * or Jaguar3's coex thread), so it must be cheap and thread-safe; set it
+   * before the RX/coex path starts. On the HalMAC dies a report's sw_define
+   * is the tag IRtlRadio::NextTxReportTag() gave the frame, which is how a
+   * caller joins a report to the frame it sent. An empty function clears it. */
+  void SetTxReportSink(std::function<void(const devourer::TxReport &)> sink) {
+    std::unique_lock<std::mutex> lk(_tx_report_sink_mu);
+    _tx_report_sink = std::move(sink);
+    /* Returns only once no earlier sink is still executing, so a caller may
+     * destroy what its sink captured right after. Never call this from
+     * inside the sink itself. */
+    _tx_report_sink_cv.wait(lk, [this] { return _tx_report_inflight == 0; });
+  }
 
   /* TX submission health snapshot (see TxStats.h) — the driver-side drop /
    * congestion signal an adaptive-link controller uses to detect a full TX FIFO
@@ -755,6 +779,33 @@ public:
    * Init/InitWrite). On Jaguar1 a failed FW boot does not abort bring-up —
    * this is the only place the failure is visible to a caller. */
   virtual devourer::FwBootStatus GetFwBootStatus() { return {}; }
+
+
+protected:
+  /* Emit the `tx.report` event and hand the report to the sink, if any. */
+  void DeliverTxReport(devourer::EventSink &events, const devourer::TxReport &r,
+                       const char *fmt) {
+    devourer::emit_tx_report(events, r, fmt);
+    std::function<void(const devourer::TxReport &)> sink;
+    {
+      std::lock_guard<std::mutex> lk(_tx_report_sink_mu);
+      if (!_tx_report_sink) return;
+      sink = _tx_report_sink;
+      ++_tx_report_inflight;
+    }
+    sink(r);
+    {
+      std::lock_guard<std::mutex> lk(_tx_report_sink_mu);
+      --_tx_report_inflight;
+    }
+    _tx_report_sink_cv.notify_all();
+  }
+
+private:
+  std::mutex _tx_report_sink_mu;
+  std::condition_variable _tx_report_sink_cv;
+  int _tx_report_inflight = 0;
+  std::function<void(const devourer::TxReport &)> _tx_report_sink;
 
 };
 

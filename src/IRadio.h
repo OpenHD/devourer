@@ -187,6 +187,10 @@ public:
   /* Snapshot of the knob state + representative effective indices (register
    * readback where the family's TXAGC block is readable). */
   virtual devourer::TxPowerState GetTxPowerState() { return {}; }
+  // Explicit diagnostic snapshot: may perform additional USB register reads.
+  virtual devourer::TxPowerState GetTxPowerDiagnosticState() {
+    return GetTxPowerState();
+  }
 
   /* Chip thermal-meter snapshot (RF 0x42 family; efuse baseline where the
    * family wires one — see src/ThermalStatus.h). The PA-heating input of the

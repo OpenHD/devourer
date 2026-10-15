@@ -2415,6 +2415,29 @@ devourer::TxPowerState RtlJaguarDevice::GetTxPowerState() {
   return s;
 }
 
+devourer::TxPowerState RtlJaguarDevice::GetTxPowerDiagnosticState() {
+  auto s = GetTxPowerState();
+  if (s.hw_readback) {
+    s.jaguar1_paths = std::min<uint8_t>(_eepromManager->numTotalRfPath, 2);
+    for (uint8_t p = 0; p < s.jaguar1_paths; ++p) {
+      const uint16_t bank = p == 0 ? 0xc00 : 0xe00;
+      s.jaguar1_mcs03[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x2c, 0xffffffff);
+      s.jaguar1_mcs47[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x30, 0xffffffff);
+      s.jaguar1_training[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x54, 0xffffffff);
+      s.jaguar1_swing[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x1c, 0xffffffff);
+      s.jaguar1_expected_mcs0[p] =
+          _radioManagement->ComputeTxPowerIndex(p, 0x80, 0);
+      s.jaguar1_expected_mcs7[p] =
+          _radioManagement->ComputeTxPowerIndex(p, 0x87, 0);
+    }
+  }
+  return s;
+}
+
 void RtlJaguarDevice::SetTxMode(const devourer::TxMode& mode) {
   _tx_mode_default = mode;
 }

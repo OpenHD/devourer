@@ -216,6 +216,7 @@ public:
   int SetXtalCap(int cap) override;
   int GetXtalCap() override { return _xtal_cap; }
   devourer::TxPowerState GetTxPowerState() override;
+  devourer::TxPowerState GetTxPowerDiagnosticState() override;
   /* Per-chip TX caps (IRadio): n_ss + STBC/LDPC/SGI/bw from the EFUSE
    * RF-type. STBC needs >=2 chains, so 1T1R cuts (8811AU/8821AU) report
    * stbc_ok=false and send_packet drops an STBC request. */

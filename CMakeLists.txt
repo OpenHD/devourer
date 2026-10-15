@@ -1195,6 +1195,12 @@ target_link_libraries(TxQuiesceSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME tx_quiesce_seam COMMAND TxQuiesceSelftest)
 
+if(DEVOURER_JAGUAR1)
+    add_executable(Jaguar1TxPowerWriteSelftest tests/jaguar1_txpower_write_selftest.cpp)
+    target_link_libraries(Jaguar1TxPowerWriteSelftest PRIVATE devourer PkgConfig::libusb)
+    add_test(NAME jaguar1_txpower_writes COMMAND Jaguar1TxPowerWriteSelftest)
+endif()
+
 # Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
 # the gate-only clear staying gate-only, and the retarget seam. This test does
 # not model silicon or instantiate Rtl8733bDevice; those are covered by the

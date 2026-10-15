@@ -130,6 +130,8 @@ class RadioManagementModule {
   std::atomic<int> txpwr_offset_steps_{0};
   std::atomic<bool> txpwr_sat_low_{false};
   std::atomic<bool> txpwr_sat_high_{false};
+  std::atomic<uint32_t> txagc_writes_attempted_{0};
+  std::atomic<uint32_t> txagc_writes_failed_{0};
   /* Caller-supplied per-rate shape (SetTxPowerRateDiffs), held as a flat array
    * in the TxRateDiffsQdb field order (cck, legacy, mcs0..7) rather than the
    * struct: ComputeTxPowerIndex reads the ONE entry its rate needs with a
@@ -243,6 +245,8 @@ public:
   bool HasTxPowerRateDiffs() const { return txpwr_diffs_set_; }
   bool TxPowerSaturatedLow() const { return txpwr_sat_low_; }
   bool TxPowerSaturatedHigh() const { return txpwr_sat_high_; }
+  uint32_t TxPowerWritesAttempted() const { return txagc_writes_attempted_; }
+  uint32_t TxPowerWritesFailed() const { return txagc_writes_failed_; }
   /* Effective per-rate TXAGC index for the current channel/BW: the flat
    * override (when armed) or the EFUSE per-rate base (or the legacy `power`
    * fallback), plus the runtime offset, clamped to the 6-bit field with the

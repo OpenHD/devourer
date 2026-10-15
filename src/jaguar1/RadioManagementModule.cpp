@@ -2294,6 +2294,8 @@ void RadioManagementModule::PHY_SetTxPowerLevel8812(uint8_t Channel) {
    * the flags whenever the offset/override pushes any rate onto a 6-bit rail. */
   txpwr_sat_low_ = false;
   txpwr_sat_high_ = false;
+  txagc_writes_attempted_ = 0;
+  txagc_writes_failed_ = 0;
   /* With a caller per-rate table armed, warm the per-path anchor cache once
    * for this pass — otherwise every one of the ~50 rates per path would repeat
    * the EFUSE lookup. Gated so the default walk issues no extra lookups and
@@ -2318,6 +2320,11 @@ void RadioManagementModule::PHY_SetTxPowerLevel8812(uint8_t Channel) {
     if (!is_8814a) {
       PHY_TxPowerTrainingByPath_8812((RfPath)path);
     }
+  }
+  if (txagc_writes_attempted_ == 0 || txagc_writes_failed_ != 0) {
+    _logger->warn("Jaguar1 TXAGC update incomplete: attempted={} failed={} paths={}",
+                  txagc_writes_attempted_.load(), txagc_writes_failed_.load(),
+                  unsigned(_eepromManager->numTotalRfPath));
   }
 }
 
@@ -2526,6 +2533,12 @@ void RadioManagementModule::PHY_SetTxPowerIndex_8812A(uint32_t powerIndex,
                                                       MGN_RATE rate) {
 
   DVR_DEBUG(_logger, "PHY_SetTxPowerIndex {} {} {}", powerIndex, (int)rfPath, rate);
+  // The USB transport returns false for a failed/short control write. Keep
+  // that result separate from the requested gain and from register readback.
+  const auto write_power = [&](uint16_t address, uint32_t mask, uint32_t value) {
+    ++txagc_writes_attempted_;
+    if (!_device.phy_set_bb_reg(address, mask, value)) ++txagc_writes_failed_;
+  };
 
   /* 8814A: per-rate per-path power index is programmed via a single packed
    * BB-register write at 0x1998. Port of PHY_SetTxPowerIndex_8814A from
@@ -2546,10 +2559,10 @@ void RadioManagementModule::PHY_SetTxPowerIndex_8812A(uint32_t powerIndex,
         (static_cast<uint32_t>(rfPath) << 8) |
         static_cast<uint32_t>(MRateToHwRate(static_cast<uint8_t>(rate))) |
         (powerIndex << 24);
-    _device.phy_set_bb_reg(0x1998, bMaskDWord, txagc_table_wd);
+    write_power(0x1998, bMaskDWord, txagc_table_wd);
     if (rate == MGN_1M) {
       /* Upstream comment: "first time to turn on the txagc table". */
-      _device.phy_set_bb_reg(0x1998, bMaskDWord, txagc_table_wd);
+      write_power(0x1998, bMaskDWord, txagc_table_wd);
     }
     return;
   }
@@ -2573,198 +2586,198 @@ void RadioManagementModule::PHY_SetTxPowerIndex_8812A(uint32_t powerIndex,
   if (rfPath == RF_PATH_A) {
     switch (rate) {
     case MGN_1M:
-      _device.phy_set_bb_reg(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_2M:
-      _device.phy_set_bb_reg(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_5_5M:
-      _device.phy_set_bb_reg(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_11M:
-      _device.phy_set_bb_reg(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_CCK11_CCK1_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_6M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_9M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_12M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_18M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Ofdm18_Ofdm6_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_24M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_36M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_48M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_54M:
-      _device.phy_set_bb_reg(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Ofdm54_Ofdm24_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_MCS0:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte0, powerIndex);
+      write_power(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte0, powerIndex);
       break;
     case MGN_MCS1:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte1, powerIndex);
+      write_power(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte1, powerIndex);
       break;
     case MGN_MCS2:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte2, powerIndex);
+      write_power(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte2, powerIndex);
       break;
     case MGN_MCS3:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte3, powerIndex);
+      write_power(rTxAGC_A_MCS3_MCS0_JAguar, bMaskByte3, powerIndex);
       break;
 
     case MGN_MCS4:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte0, powerIndex);
+      write_power(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte0, powerIndex);
       break;
     case MGN_MCS5:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte1, powerIndex);
+      write_power(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte1, powerIndex);
       break;
     case MGN_MCS6:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte2, powerIndex);
+      write_power(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte2, powerIndex);
       break;
     case MGN_MCS7:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte3, powerIndex);
+      write_power(rTxAGC_A_MCS7_MCS4_JAguar, bMaskByte3, powerIndex);
       break;
 
     case MGN_MCS8:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_MCS9:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_MCS10:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_MCS11:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_MCS11_MCS8_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_MCS12:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_MCS13:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_MCS14:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_MCS15:
-      _device.phy_set_bb_reg(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_MCS15_MCS12_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT1SS_MCS0:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS1:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS2:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS3:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Nss1Index3_Nss1Index0_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT1SS_MCS4:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS5:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS6:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS7:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Nss1Index7_Nss1Index4_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT1SS_MCS8:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS9:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS0:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS1:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Nss2Index1_Nss1Index8_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT2SS_MCS2:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS3:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS4:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS5:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Nss2Index5_Nss2Index2_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT2SS_MCS6:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte0,
+      write_power(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS7:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte1,
+      write_power(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS8:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte2,
+      write_power(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS9:
-      _device.phy_set_bb_reg(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte3,
+      write_power(rTxAGC_A_Nss2Index9_Nss2Index6_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
@@ -2775,198 +2788,198 @@ void RadioManagementModule::PHY_SetTxPowerIndex_8812A(uint32_t powerIndex,
   } else if (rfPath == RF_PATH_B) {
     switch (rate) {
     case MGN_1M:
-      _device.phy_set_bb_reg(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_2M:
-      _device.phy_set_bb_reg(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_5_5M:
-      _device.phy_set_bb_reg(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_11M:
-      _device.phy_set_bb_reg(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_CCK11_CCK1_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_6M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_9M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_12M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_18M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Ofdm18_Ofdm6_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_24M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_36M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_48M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_54M:
-      _device.phy_set_bb_reg(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Ofdm54_Ofdm24_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_MCS0:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte0, powerIndex);
+      write_power(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte0, powerIndex);
       break;
     case MGN_MCS1:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte1, powerIndex);
+      write_power(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte1, powerIndex);
       break;
     case MGN_MCS2:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte2, powerIndex);
+      write_power(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte2, powerIndex);
       break;
     case MGN_MCS3:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte3, powerIndex);
+      write_power(rTxAGC_B_MCS3_MCS0_JAguar, bMaskByte3, powerIndex);
       break;
 
     case MGN_MCS4:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte0, powerIndex);
+      write_power(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte0, powerIndex);
       break;
     case MGN_MCS5:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte1, powerIndex);
+      write_power(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte1, powerIndex);
       break;
     case MGN_MCS6:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte2, powerIndex);
+      write_power(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte2, powerIndex);
       break;
     case MGN_MCS7:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte3, powerIndex);
+      write_power(rTxAGC_B_MCS7_MCS4_JAguar, bMaskByte3, powerIndex);
       break;
 
     case MGN_MCS8:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_MCS9:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_MCS10:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_MCS11:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_MCS11_MCS8_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_MCS12:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_MCS13:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_MCS14:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_MCS15:
-      _device.phy_set_bb_reg(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_MCS15_MCS12_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT1SS_MCS0:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS1:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS2:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS3:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Nss1Index3_Nss1Index0_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT1SS_MCS4:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS5:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS6:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS7:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Nss1Index7_Nss1Index4_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT1SS_MCS8:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT1SS_MCS9:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS0:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS1:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Nss2Index1_Nss1Index8_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT2SS_MCS2:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS3:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS4:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS5:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Nss2Index5_Nss2Index2_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
     case MGN_VHT2SS_MCS6:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte0,
+      write_power(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte0,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS7:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte1,
+      write_power(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte1,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS8:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte2,
+      write_power(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte2,
                              powerIndex);
       break;
     case MGN_VHT2SS_MCS9:
-      _device.phy_set_bb_reg(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte3,
+      write_power(rTxAGC_B_Nss2Index9_Nss2Index6_JAguar, bMaskByte3,
                              powerIndex);
       break;
 
@@ -2981,7 +2994,7 @@ void RadioManagementModule::PHY_SetTxPowerIndex_8812A(uint32_t powerIndex,
         {
             if (rfTable.TryGetValue(rate, out var values))
             {
-                _device.phy_set_bb_reg(values.RegAddress, values.BitMask, powerIndex);
+                write_power(values.RegAddress, values.BitMask, powerIndex);
             }
             else
             {

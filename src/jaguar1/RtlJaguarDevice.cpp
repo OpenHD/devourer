@@ -2389,6 +2389,9 @@ devourer::TxPowerState RtlJaguarDevice::GetTxPowerState() {
   s.offset_qdb = static_cast<int16_t>(s.offset_steps * 2);
   s.saturated_low = _radioManagement->TxPowerSaturatedLow();
   s.saturated_high = _radioManagement->TxPowerSaturatedHigh();
+  s.tx_write_status_valid = _brought_up;
+  s.txagc_writes_attempted = _radioManagement->TxPowerWritesAttempted();
+  s.txagc_writes_failed = _radioManagement->TxPowerWritesFailed();
   const bool is_8814 = _eepromManager->version_id.ICType == CHIP_8814A;
   if (_brought_up && !is_8814 && !_cw_active) {
     /* Path-A representative indices straight from the TXAGC registers:

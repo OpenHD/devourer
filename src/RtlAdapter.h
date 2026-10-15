@@ -170,7 +170,7 @@ public:
   }
 
   uint8_t efuse_OneByteRead(uint16_t addr, uint8_t *data);
-  void phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask, uint32_t data);
+  bool phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask, uint32_t data);
 
   /* 32-bit-address register write (see ITransport::write32_wide) — the
    * halbb/halrf BB window lives at addr + 0x10000 (wIndex=1 over USB), out of
@@ -219,7 +219,7 @@ public:
 
 private:
   void init_from_transport(const devourer::DeviceConfig &cfg);
-  void PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
+  bool PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
                         uint32_t dataOriginal);
 };
 

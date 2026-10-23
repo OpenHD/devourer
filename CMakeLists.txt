@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
 
-# Set the toolchain file for vcpkg on Windows (only if VCPKG_ROOT is set;
-# on mingw we get libusb from pkg-config directly).
-if(WIN32 AND NOT "$ENV{VCPKG_ROOT}" STREQUAL "")
+# Standalone Windows builds pick up vcpkg from VCPKG_ROOT (on mingw without it
+# we get libusb from pkg-config directly). Only when devourer is the top-level
+# project and no toolchain was chosen: a parent (e.g. OpenHD's presets) owns it.
+if(WIN32 AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
+        AND NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT "$ENV{VCPKG_ROOT}" STREQUAL "")
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
 endif()
 

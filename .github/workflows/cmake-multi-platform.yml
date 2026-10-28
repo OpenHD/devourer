@@ -97,7 +97,7 @@ jobs:
         # DEVOURER_MT7612U=ON: the option defaults OFF, so without it here the
         # MediaTek subtree would be compiled by nothing but its own Makefile on
         # Linux. Turning it on in the matrix is what makes MSVC and macOS
-        # first-class for the LIBRARY — the POSIX-only pieces it still has (the
+        # first-class for the LIBRARY â€” the POSIX-only pieces it still has (the
         # flock adapter lock) are _WIN32-guarded, and this is what proves it.
         # The mt7612uprobe bench tool is NOT portable and is gated on UNIX in
         # CMakeLists.txt; it is deliberately outside that claim.
@@ -142,18 +142,18 @@ jobs:
       - name: Set up MSYS2 / mingw-w64
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-openssl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-openssl
 
       - name: Configure CMake (mingw, pkg-config libusb, no vcpkg)
-        # VCPKG_ROOT is unset, so CMakeLists takes the pkg-config path — the
+        # VCPKG_ROOT is unset, so CMakeLists takes the pkg-config path â€” the
         # exact configuration the mingw binary-stdin fix exists for.
         run: >
           cmake -B build -G Ninja
@@ -167,7 +167,7 @@ jobs:
         # rxdemo / txdemo / precoder use POSIX-only APIs
         # (e.g. fork() in examples/tx/main.cpp for the DEVOURER_TX_WITH_RX path) and
         # are not mingw targets, so this job can't build the whole tree. It builds
-        # the stdin-driven stream demos plus the `selftests` aggregate — a target
+        # the stdin-driven stream demos plus the `selftests` aggregate â€” a target
         # that depends on every *Selftest binary (collected automatically in
         # CMakeLists.txt), so a newly-added self-test is picked up here without
         # touching this file, and a REGISTERED one can never be skipped into a
@@ -248,7 +248,7 @@ jobs:
   # headless suite run under ASan/UBSan. Leak detection is off here: the
   # selftests are pure computation and never open a device, so the only
   # allocations still live at exit would come from libusb in demo code this
-  # job never runs — leak triage belongs to the on-hardware runs.
+  # job never runs â€” leak triage belongs to the on-hardware runs.
   build-sanitizers:
     runs-on: ubuntu-latest
     steps:

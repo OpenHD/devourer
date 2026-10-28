@@ -471,6 +471,10 @@ constexpr uint16_t R_AX_HALT_H2C_CTRL = 0x0160;
 constexpr uint16_t R_AX_HALT_C2H_CTRL = 0x0164;
 constexpr uint16_t R_AX_HALT_H2C = 0x0168;
 constexpr uint16_t R_AX_HALT_C2H = 0x016C;
+/* SER debug dump (dbgpkg.c dump_err_status_dmac): which DMAC error raised a
+ * halt. Both dies. */
+constexpr uint16_t R_AX_DMAC_ERR_ISR = 0x8524;
+constexpr uint16_t R_AX_SER_DBG_INFO = 0x8424;
 constexpr uint16_t R_AX_HISR0 = 0x01A4;
 constexpr uint16_t R_AX_WCPU_FW_CTRL = 0x01E0;
 /* RISC-V (8852C) bootrom debug: [31:16]=boot_status (fwdl-step code),
@@ -626,6 +630,12 @@ constexpr uint8_t USR_TX_RPT_MODE_LAST_PKT = 2;
  * | WIFI_ROLE[16:13] | BAND[18:17] | PORT[21:19]. */
 constexpr uint8_t FWCMD_H2C_CL_MEDIA_RPT = 0x8;
 constexpr uint8_t FWCMD_H2C_FUNC_FWROLE_MAINTAIN = 0x4;
+/* JOININFO (same MEDIA_RPT class, func 0): the fw "STA connected" op. One dword
+ * w0 = MACID[7:0] | OP[8] (0=connect,1=disconnect) | BAND[9] | WMM[11:10] |
+ * TGR[12] | ISHESTA[13] | DLBW[15:14] | TF_MAC_PAD[17:16] | DL_T_PE[20:18] |
+ * PORT_ID[23:21] | NET_TYPE[25:24] | WIFI_ROLE[29:26] | SELF_ROLE[31:30]
+ * (rtw89 fw.c rtw89_fw_h2c_join_info, fw.h RTW89_H2C_JOININFO_W0_*). */
+constexpr uint8_t FWCMD_H2C_FUNC_JOININFO = 0x0;
 constexpr uint8_t H2C_FWROLE_SELF_ROLE_SH = 8;  /* mask 0x3 */
 constexpr uint8_t H2C_FWROLE_UPD_MODE_SH = 10;  /* mask 0x7 */
 constexpr uint8_t H2C_FWROLE_WIFI_ROLE_SH = 13; /* mask 0xf */
@@ -677,8 +687,14 @@ constexpr uint8_t FWCMD_H2C_CL_FR_EXCHG = 0x5;
 constexpr uint8_t FWCMD_H2C_FUNC_CCTLINFO_UD = 0x2;
 constexpr uint8_t FWCMD_H2C_FUNC_DCTLINFO_UD = 0x1;
 
-/* addr_cam entry geometry (addr_cam.h): 8852B uses the LONG entry (0x40). */
+/* addr_cam entry geometry (addr_cam.h get_addr_cam_size): the 8852B uses the
+ * LONG entry (0x40) as its CAM stride, the 8852C the SHORT one (0x20). */
 constexpr uint8_t ADDR_CAM_ENT_LONG_SIZE = 0x40;
+/* The entry length the vendor driver writes for an associated station. */
+constexpr uint8_t ADDR_CAM_ENT_SHORT_SIZE = 0x20;
+/* ADDR_CAM in the MAC table SRAM (rtw89 ADDR_CAM_BASE_ADDR), read through the
+ * FILTER_MODEL_ADDR / INDIR_ACCESS_ENTRY window. */
+constexpr uint32_t ADDR_CAM_MEM_BASE = 0x18850000;
 constexpr uint8_t BSSID_CAM_ENT_SIZE = 0x08;
 /* mac_ax_addr_msk_sel (mac_def.h). */
 constexpr uint8_t MAC_AX_NO_MSK = 0;
@@ -1402,6 +1418,8 @@ constexpr uint8_t B_AX_TXSC_20M_SH = 0;
 constexpr uint8_t B_AX_TXSC_40M_SH = 4;
 constexpr uint8_t B_AX_TXSC_80M_SH = 8;
 constexpr uint32_t B_AX_TXSC_MSK = 0xf;
+constexpr uint16_t R_AX_WMAC_RFMOD = 0xC010;
+constexpr uint32_t B_AX_WMAC_RFMOD_MSK = 0x3; /* [1:0]: 0/1/2/3 = 20/40/80/160 */
 constexpr uint16_t R_AX_PTCL_RRSR1 = 0xC090;
 constexpr uint8_t B_AX_RRSR_RATE_EN_SH = 8;
 constexpr uint32_t B_AX_RRSR_RATE_EN_MSK = 0xf;
@@ -1567,6 +1585,17 @@ constexpr uint32_t WMAC_SPEC_SIFS_CCK = 0xA;
 constexpr uint8_t B_AX_WMAC_SPEC_SIFS_OFDM_SH = 8;
 constexpr uint32_t B_AX_WMAC_SPEC_SIFS_OFDM_MSK = 0xff;
 constexpr uint32_t WMAC_SPEC_SIFS_OFDM_52B = 0x11;
+/* Response (ACK/CTS/BA) abort gates in the same register (rtw89 reg.h): the
+ * RMAC drops a SIFS response when an armed check reads the medium busy. */
+constexpr uint32_t B_AX_RSP_CHK_CCA = 1u << 23;
+constexpr uint32_t B_AX_RSP_CHK_EDCCA = 1u << 24;
+constexpr uint32_t B_AX_RSP_CHK_BTCCA = 1u << 25;
+constexpr uint32_t B_AX_RSP_CHK_SEC_CCA_20 = 1u << 26;
+constexpr uint32_t B_AX_RSP_CHK_SEC_CCA_40 = 1u << 27;
+constexpr uint32_t B_AX_RSP_CHK_SEC_CCA_80 = 1u << 28;
+constexpr uint32_t B_AX_RSP_CHK_ALL =
+    B_AX_RSP_CHK_CCA | B_AX_RSP_CHK_EDCCA | B_AX_RSP_CHK_BTCCA |
+    B_AX_RSP_CHK_SEC_CCA_20 | B_AX_RSP_CHK_SEC_CCA_40 | B_AX_RSP_CHK_SEC_CCA_80;
 constexpr uint16_t R_AX_RXTRIG_TEST_USER_2 = 0xCCB0;
 constexpr uint32_t B_AX_RXTRIG_FCSCHK_EN = 1u << 20;
 constexpr uint16_t R_AX_TRXPTCL_RRSR_CTL_0 = 0xCC08;
@@ -1730,6 +1759,12 @@ constexpr uint16_t R_AX_HAXI_DMA_BUSY2 = 0x11C8;     /* [1:0] CH10/CH11 */
 constexpr uint32_t HAXI_DMA_BUSY2_CHANS = 0x3u;
 constexpr uint16_t R_AX_HAXI_DMA_BUSY3 = 0x1208;     /* [1:0] RXQ/RPQ */
 constexpr uint32_t HAXI_DMA_BUSY3_RX = 0x3u;
+/* HAXI error dump (dbgpkg.c dump_err_status_haxidma_ax, 8852C/8192XB/8852D
+ * only). HAXI_IDCT bit 1 = B_AX_RXMDA_STUCK_IDCT. */
+constexpr uint16_t R_AX_HAXI_IDCT_MSK = 0x10B8;
+constexpr uint16_t R_AX_HAXI_IDCT = 0x10BC;
+constexpr uint16_t R_AX_DBG_ERR_FLAG_V1 = 0x1104;
+constexpr uint16_t R_AX_HDP_DBG_INFO_2_V1 = 0x8888;
 constexpr uint16_t R_AX_TXBD_RWPTR_CLR1 = 0x1014;    /* [10:0] ACH0-7,CH8,CH9,CH12 */
 constexpr uint32_t TXBD_RWPTR_CLR1_ALL = 0x7FFu;
 constexpr uint16_t R_AX_TXBD_RWPTR_CLR2_V1 = 0x11C4; /* [1:0] CH10/CH11 */

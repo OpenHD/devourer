@@ -305,7 +305,7 @@ void RtlKestrelDevice::Init(Action_ParsedRadioPacket packetProcessor,
   if (_ack_disarm_after_ms) {
     const uint32_t delay_ms = *_ack_disarm_after_ms;
     _ack_disarm_after_ms.reset();
-    _ack_disarm_thread = std::jthread([this, delay_ms](std::stop_token stop) {
+    _ack_disarm_thread = devourer::CancellableThread([this, delay_ms](devourer::StopToken stop) {
       const auto deadline = std::chrono::steady_clock::now() +
                             std::chrono::milliseconds(delay_ms);
       while (!stop.stop_requested() &&

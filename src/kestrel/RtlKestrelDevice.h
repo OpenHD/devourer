@@ -8,7 +8,7 @@
 #include <mutex>
 #include <optional>
 #include "PacketSpan.h"
-#include <thread>
+#include "CancellableThread.h"
 
 #include "TxMode.h"
 
@@ -359,7 +359,7 @@ private:
   bool peer_slot_reserved(const char *who, uint8_t macid,
                           uint8_t addr_cam_idx) const;
   std::optional<uint32_t> _ack_disarm_after_ms;
-  std::jthread _ack_disarm_thread;
+  devourer::CancellableThread _ack_disarm_thread;
   /* DEVOURER_ACK_RESPONDER: arm at the end of bring-up, throw if refused. */
   void arm_configured_ack_responder();
   uint8_t _tx_mgmt_q = 0;

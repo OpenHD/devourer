@@ -777,7 +777,7 @@ RtlKestrelDevice::disarm_ack_locked(devourer::PacketSpan<const devourer::MacAddr
   }
   _logger->info("Kestrel: hardware ACK responder disarmed (ADDR_CAM entry {} "
                 "no longer holds {})", ack_slot(),
-                mac_text(held.front().bytes.data()));
+                mac_text(held[0].bytes.data()));
   return std::nullopt;
 }
 

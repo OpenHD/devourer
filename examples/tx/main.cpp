@@ -49,6 +49,7 @@
 #include "SweepSpec.h"
 #include "TxPower.h" /* txpkt_pwr_db_for_step — DEVOURER_TX_PKT_OFSET fan-out */
 #include "caps_event.h"
+#include "poll_skip.h"
 #include "station_arm_env.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
@@ -1080,6 +1081,21 @@ int main(int argc, char **argv) {
     logger->error("TX bring-up failed: {}", e.what());
     return 1;
   }
+  /* DEVOURER_CCA_GATES=<primary>,<edcca> (each 0/1, 1 = that gate OFF): the
+   * one-bit-at-a-time form of DEVOURER_DIS_CCA (IRtlRadio::SetCcaGates) for
+   * telling a preamble deferral from an energy deferral on a band where
+   * injection stalls. Demo-local; applied once the MAC is up. */
+  if (const char *g = std::getenv("DEVOURER_CCA_GATES")) {
+    int p = 0, e = 0;
+    if (sscanf(g, "%d,%d", &p, &e) == 2) {
+      auto *rtl = dynamic_cast<IRtlRadio *>(rtlDevice);
+      if (!rtl || !rtl->SetCcaGates(p != 0, e != 0))
+        logger->error("DEVOURER_CCA_GATES: SetCcaGates refused (not ported on "
+                      "this backend or not brought up)");
+    } else {
+      logger->error("DEVOURER_CCA_GATES: want <primary>,<edcca> (0/1 each)");
+    }
+  }
 
   write_sentinel(0xBEEF, "post-init/pre-TX");
   devourer::Ev(*g_ev, "init.timing")
@@ -1429,6 +1445,7 @@ int main(int argc, char **argv) {
                  "warn_delta={}", thermal_poll_ms, thermal_warn_delta);
   }
   bool thermal_warned = false;
+  devourer::PollSkips thermal_skips("DEVOURER_THERMAL_POLL_MS");
   auto thermal_next_poll = std::chrono::steady_clock::now() +
       std::chrono::milliseconds(thermal_poll_ms);
 
@@ -2588,7 +2605,12 @@ int main(int argc, char **argv) {
         std::chrono::steady_clock::now() >= thermal_next_poll) {
       thermal_next_poll = std::chrono::steady_clock::now() +
           std::chrono::milliseconds(thermal_poll_ms);
-      auto t = rtlDevice->GetThermalStatus();
+      devourer::ThermalStatus t;
+      try {
+        t = rtlDevice->GetThermalStatus();
+      } catch (const std::exception &e) {
+        thermal_skips.note(*logger, e);
+      }
       if (t.valid || t.raw != 0) {
         devourer::Ev ev(*g_ev, "thermal");
         ev.t().f("raw", t.raw);

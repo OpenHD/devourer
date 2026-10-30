@@ -40,7 +40,9 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   and rtl8822e (RTL8812EU/8822EU, chip-id `0x17`). 5/10 MHz narrowband,
   80 MHz (incl. a 40-in-80 frame), halrf calibration. Sustained 5 GHz TX
   needs the coex runtime thread (started in `InitWrite`) — without it the
-  combo chip's coex firmware silences the antenna. 8822e constraints:
+  combo chip's coex firmware silences the antenna. A host that owns bulk-IN
+  itself can opt out (`tuning.j3_runtime_thread`, see `src/jaguar3/CLAUDE.md`
+  for what that costs). 8822e constraints:
   `docs/8822e-quirks.md`.
 - **Kestrel** (`src/kestrel/`): the Wi-Fi 6 / 802.11ax generation —
   RTL8852BU/8832BU (variant C8852B) and RTL8852CU/8832CU (C8852C), one HAL
@@ -52,7 +54,12 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   path. On-air-validated: monitor RX (both dies, 2.4/5 GHz), TX injection
   (legacy/HT/VHT/HE + HE ER SU/DCM — `docs/he-extended-range.md`),
   5/10/20/40/80 MHz on both dies + 160 MHz on the 8852C only; 6 GHz TX tops
-  out at 80 MHz (the 6G+160 TX-enable path is un-ported). TX power is a fixed
+  out at 80 MHz (the 6G+160 TX-enable path is un-ported). On 6 GHz the BB
+  EDCCA energy-detect is parked at the vendor's unlinked level (the receiver's
+  own floor as the BB measures it, -67..-69 dBm without DIG, latches the
+  default's hysteresis band busy and every injected frame defers); preamble
+  carrier sense stays on and the regulatory 6 GHz energy-detect level is
+  **not** enforced — `src/kestrel/CLAUDE.md`. TX power is a fixed
   BB dBm (`DEVOURER_TX_PWR`, whole dBm here). The 8852A-family (RTL8832AU) is
   deliberately excluded. Quirks: `docs/8852c-quirks.md`.
 - **RTL8733B** (`src/rtl8733b/`): the 802.11n generation — RTL8731BU/RTL8733BU
@@ -76,22 +83,39 @@ the TP-Link TX50UH is RTL8832**C**U (8852C-family) despite lab lore calling it
 supported, RTL8733B**S** is the SDIO sibling and has no transport here. Full
 chip / bench-throughput table: README **Supported hardware**.
 
-**PCIe** (`DEVOURER_PCIE=ON`, Linux-only, default OFF): the RTL8821CE — the
-PCIe sibling of the 8821CU — rides the same Jaguar2 HAL through a vfio-pci
-transport (`src/PcieTransport.{h,cpp}`: BAR2 MMIO registers over the same
-0x0000..0xFFFF space the USB vendor-control path addresses, 88xx
-buffer-descriptor DMA rings for TX/RX). USB and PCIe are independent
-transports behind `devourer::ITransport` (`src/Transport.h`); the
-bus-neutral `RtlAdapter` the HALs hold forwards to whichever it was built
-with. The few genuinely bus-specific bring-up steps gate on `is_usb()` (PCIe
-power-seq rows, PQ map, no USB RX-agg, no DLFW 512-pad) or ride `hci_setup()`
-(pre-power TRX ring programming, no-op on USB). Factory:
-`WiFiDriver::CreateRadioPcie(PcieTransport::Open(bdf, logger))` — the
-caller owns vfio like it owns libusb. Demos: `DEVOURER_PCIE_BDF=0000:01:00.0`
-on rxdemo and txdemo; `pcieprobe <bdf>` validates the layers bottom-up.
-Bind/restore: `tests/pcie_vfio_bind.sh` — driver_override, **not** new_id,
-because of the in-tree rtw88 auto-probe race. Validation: `sudo python3
-tests/pcie_rx_smoke.py` against a vfio-bound 8821CE.
+**PCIe** (`DEVOURER_PCIE=ON`, Linux-only, default OFF): two parts ride their
+USB siblings' HALs unchanged through one vfio-pci transport
+(`src/PcieTransport.{h,cpp}`: BAR2 MMIO registers, the caller owns vfio like
+it owns libusb). The RTL8821CE (PCIe 8821CU) is the Jaguar2 HAL over the
+88xx buffer-descriptor DMA rings (`src/PcieDma88xx.cpp`); the RTL8852CE
+(PCIe 8852CU, `10ec:c852`) is the Kestrel HAL over the AX HAXI plane
+(`src/PcieDmaAx.cpp`: 13 TXBD rings, WD pages + addr_info over a per-page
+payload bounce, CH12 fwcmd slots for FWDL/H2C, RXQ/RPQ rings with
+release-report page recycling — the rtw89 host contract, since the vendor
+USB drop ships no PCIe ring driver). `Open()` picks the plane from the PCI
+device id; the factory dispatches `c852` before reading the Jaguar chip-id,
+and refuses the RTL8852BE (`b852`, power sequence unported). USB and PCIe are
+independent transports behind `devourer::ITransport` (`src/Transport.h`);
+the bus-neutral `RtlAdapter` forwards to whichever it was built with. The
+bus-specific bring-up steps gate on `is_usb()` or ride `hci_setup()` — the
+ring-register programming slot, which each generation places where its
+vendor puts intf_pre_init (Jaguar2: before power-on; Kestrel: after
+`dmac_func_pre_en`, before FWDL). Two MMIO facts the USB path never
+exposed: a 32-bit access to a 2-byte-aligned register (the HALs do this
+freely — `R_AX_SYS_FUNC_EN` is at 0x0002) is a malformed TLP the chip
+completer-aborts (reads all-ones, drops the write; the BB never left reset
+until the transport started splitting misaligned accesses), and the
+completion timeout stays enabled on the AX parts so a device that stops
+answering returns all-ones instead of hanging the CPU in the load. Factory:
+`WiFiDriver::CreateRadioPcie(PcieTransport::Open(bdf, logger))`. Demos:
+`DEVOURER_PCIE_BDF=0000:05:00.0` on rxdemo and txdemo; `pcieprobe <bdf>
+[id|power|fw|bb]` validates the layers bottom-up on either part. Bind/restore:
+`tests/pcie_vfio_bind.sh` — driver_override, **not** new_id, because of the
+in-tree rtw88/rtw89 auto-probe race (blacklist rtw89 on an 8852CE box: it
+pre-initializes the chip at every enumeration). Validation: `sudo python3
+tests/pcie_rx_smoke.py` (ambient beacons, either part) and
+`tests/pcie_8852ce_onair.sh` (the 8852CE cell matrix against a USB 8852C
+witness: usb→pcie, pcie→usb, pcie→pcie, exact per-direction hit counts).
 
 ## Build
 
@@ -361,8 +385,10 @@ Behavioural traps the per-field docs can't carry:
   with EDCCA off and primary CCA left on, the same Jaguar1 injector delivers
   95% on an idle channel and still 78% under a co-channel flooder; with both
   gates off it collapses to 0.3%, because it stops waiting for a gap and
-  collides instead. `SetCcaGates` (`IRtlRadio`, Jaguar1 and Jaguar3) is the
-  one-bit-at-a-time form for exactly this; `SetCcaMode` remains the portable
+  collides instead. `SetCcaGates` (`IRtlRadio`, Jaguar1, Jaguar3 and Kestrel —
+  there "primary" is CCA_EN + the sec20/40/80 bits and "edcca" EDCCA_EN;
+  txdemo drives it as `DEVOURER_CCA_GATES=<primary>,<edcca>`, 1 = that gate
+  off) is the one-bit-at-a-time form for exactly this; `SetCcaMode` remains the portable
   all-or-nothing call and is `SetCcaGates(d, d)`. Both gate calls are
   post-bring-up only and return false before it — see `src/IRtlRadio.h` for
   the contract, and `tests/cca_gates_regcheck.sh` to reproduce the tables.
@@ -426,6 +452,12 @@ temporal layer and injects each at its ladder's rate
 (`DEVOURER_SVC_LADDER="CRIT=<spec>;T0=<spec>;..."`); the application-FEC half
 (RS outer code + corrupt-frame salvage) lives in `tools/precoder/`
 (`docs/fused-fec.md`).
+
+Per-frame TX-side timing for the stream link (`src/StreamTelemetry.h`,
+`examples/common/stream_timing_tx.h`): what each frame carries, which parts
+MAC-stamp an injected frame (`AdapterCaps::hw_injected_mgmt_txtsf`) and the
+measured matrix are in `docs/stream-timing.md`; harness
+`tests/stream_timing_onair.sh`.
 
 ## Frequency hopping
 

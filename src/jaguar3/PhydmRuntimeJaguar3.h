@@ -32,13 +32,23 @@ public:
   /* One watchdog pass: FA/CCA statistics + reset, DIG, CCK-PD (2 GHz),
    * EDCCA. `channel` = current center channel (band + DFS decision),
    * `edcca_track` = false leaves 0x84c untouched (DEVOURER_DIS_CCA /
-   * SetCcaMode owns the thresholds then). */
-  void tick(uint8_t channel, bool edcca_track);
+   * SetCcaMode owns the thresholds then); `dig_track` = false skips DIG
+   * (DEVOURER_SKIP_DIG; the wide-TX IGI floor still applies, see
+   * set_igi_floor). */
+  void tick(uint8_t channel, bool edcca_track, bool dig_track);
 
   /* A channel/bandwidth change invalidates the CCK-PD applied-level cache
    * (the kernel re-checks bw/nrx from registers each apply; the level is
    * re-applied when they change). */
   void on_channel_change() { _cck_lv_valid = false; }
+
+  /* Lower bound for DIG, honoured by every later tick. 0 = none. Applied at
+   * once both ways: setting one raises IGI to it, and dropping one clamps IGI
+   * back into `channel`'s normal DIG window instead of leaving the raised gain
+   * for up to a tick. Keeping it at 0 touches no register. The wide-TX floor
+   * this carries, and why it exists: DeviceConfig::Tuning::
+   * wide_tx_igi_floor. */
+  void set_igi_floor(uint8_t floor, uint8_t channel);
 
 private:
   /* --- false-alarm / CCA statistics (this tick's window) --- */
@@ -62,6 +72,7 @@ private:
 
   /* DIG state */
   int _last_igi_logged = -1;
+  uint8_t _igi_floor = 0;
 
   /* CCK-PD state (phydm_cckpd_type4) */
   bool _cck_tbl_valid = false;

@@ -42,8 +42,7 @@ jobs:
           # upstream redefine jobs that run with this fork's credentials.
           if ! git merge-base --is-ancestor upstream/master HEAD; then
             git merge --no-commit --no-ff upstream/master
-            git rm -r --quiet --ignore-unmatch .github/workflows
-            git checkout HEAD -- .github/workflows
+            git restore --source=HEAD --staged --worktree .github/workflows
             git commit --no-edit
           fi
           git push origin HEAD:master

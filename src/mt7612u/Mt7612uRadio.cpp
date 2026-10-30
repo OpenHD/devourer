@@ -324,6 +324,7 @@ void Mt7612uRadio::tick_loop() {
 
 void Mt7612uRadio::Init(Action_ParsedRadioPacket packetProcessor,
                         SelectedChannel channel) {
+  _rx_stop = false;
   /* Stop() on the way out, as the sibling backends do: a throw from the channel
    * set or the config would otherwise leave the device open and the tick thread
    * running until the destructor happens to run, and a caller that catches and
@@ -351,7 +352,7 @@ void Mt7612uRadio::Init(Action_ParsedRadioPacket packetProcessor,
    * failed to start" left the device open and the tick running, which is the
    * half-open object this whole guard exists to prevent. */
   try {
-    StartRxLoop(std::move(packetProcessor));
+    start_rx_loop(std::move(packetProcessor), false);
   } catch (...) {
     Stop();
     throw;
@@ -392,7 +393,21 @@ void Mt7612uRadio::InitWrite(SelectedChannel channel) {
 }
 
 void Mt7612uRadio::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
+  start_rx_loop(std::move(packetProcessor), true);
+}
+
+void Mt7612uRadio::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale) {
+  /* A signal has already landed: skip the setup below rather than build it
+   * for a loop whose own predicate would exit on its first pass. */
+  if (g_devourer_should_stop)
+    return;
+
   struct mt7612u_dev *mac_failed = nullptr;
+  /* An armed station keeps its managed filter: the monitor request below is
+   * recorded, not installed (mt7612u_set_monitor_rx). The log says which
+   * filter is in force AT RX START; the usual station arms after this
+   * (IRadio.h), and SetStationIdentity logs the switch. */
+  bool station_filter = false;
   {
     /* The WHOLE prologue, arming through the failure teardown, under the same
      * lock StopRxLoop uses - and released before the sleep loop below, which
@@ -411,7 +426,12 @@ void Mt7612uRadio::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
     if (_rx_active.load())
       throw std::runtime_error("MT7612U RX loop is already active");
     _rx_processor = std::move(packetProcessor);
-    _rx_stop = false;
+    if (clear_stale) {
+      _rx_stop = false;
+    } else if (_rx_stop.load()) {
+      /* Stop requested during Init must prevent its receive loop from starting */
+      return;
+    }
     /* 64 slots is about 45 ms of headroom at the measured 1400 fps - enough to
      * ride out a slow processor without letting the producer block. The ring
      * itself is allocated here; each slot's payload buffer then grows to the
@@ -440,6 +460,8 @@ void Mt7612uRadio::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
        * value - see rule 2. Before it, this write is simply overwritten. */
       if (mt7612u_set_monitor_rx(_dev, _cfg.rx.keep_corrupted ? 1 : 0) != 0)
         _logger->warn("MT7612U monitor RX filter not applied");
+      uint8_t armed_bssid[6];
+      station_filter = mt7612u_station_bssid(_dev, armed_bssid) == 0;
       /* Arms the channel timers and zeroes the MIB counters. */
       mt7612u_link_stats_start(_dev);
       /* A window armed before this start was measuring the previous receiver
@@ -459,7 +481,8 @@ void Mt7612uRadio::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   if (mac_failed)
     throw std::runtime_error("MT7612U MAC start failed");
 
-  _logger->info("MT7612U monitor RX on channel {}", _channel.Channel);
+  _logger->info("MT7612U RX on channel {} ({} receive filter at RX start)",
+                _channel.Channel, station_filter ? "managed station" : "monitor");
 
   /* THE consumer. The C layer parses on its own event thread and enqueues; the
    * processor runs here, on the thread that called StartRxLoop, which is the
@@ -1001,8 +1024,8 @@ devourer::TxStats Mt7612uRadio::GetTxStats() {
    * a uint64_t reads as ~1.8e19. Reading it also took _mu, which send_packet
    * holds across a blocking submit - so a stats poll from another thread
    * stalled for as long as the TX ring was saturated. A documented gap beats
-   * four wrong numbers; the fix belongs in the library, which needs a
-   * monotonic wire-failure counter that outlives a ring.
+   * four wrong numbers. The library's monotonic per-frame counter is
+   * mt7612u_tx_wire_failed(), which this does not read yet.
    *
    * Counted here rather than read from mt7612u_get_stats(), which reports the
    * ASYNC RING's counters. mt_tx_raw() only uses that ring when one is running
@@ -1035,7 +1058,7 @@ void Mt7612uRadio::ClearAckResponder() {
 }
 
 /* Thin, like the rest of the control plane: on this part a station identity
- * is a check, not a configuration (station.cpp,
+ * is a check plus one register, the managed receive filter (station.cpp,
  * docs/mt7612u-station-identity.md). The ordering note IRadio requires is at
  * the declaration (Mt7612uRadio.h). */
 bool Mt7612uRadio::SetStationIdentity(const devourer::MacAddr &own,
@@ -1045,6 +1068,7 @@ bool Mt7612uRadio::SetStationIdentity(const devourer::MacAddr &own,
     return false;
   if (mt7612u_set_station_identity(_dev, own.data(), bssid.data()) != 0)
     return false;
+  _logger->info("MT7612U station identity armed: managed receive filter");
   /* The arm covers RECEIVE and auto-ACK only. What a station transmits is
    * the caller's: its unicast (management, EAPOL, data) must request an ACK -
    * build_stream_radiotap(mode, false), since the default stream radiotap is
@@ -1069,10 +1093,9 @@ bool Mt7612uRadio::ClearStationIdentity() {
    * holds (IRadio's contract for a clear with nothing to undo). */
   if (!_dev)
     return true;
-  mt7612u_clear_station_identity(_dev);
-  /* True without qualification because the arm writes no hardware state on
-   * this part: there is nothing to restore, so nothing to verify. */
-  return true;
+  /* The arm installed the managed receive filter; true only once the
+   * pre-arm filter reads back. A failure keeps the arm, so a retry works. */
+  return mt7612u_clear_station_identity(_dev) == 0;
 }
 
 /* The beacon plane. Thin on purpose: the sequence these wrap is the one the

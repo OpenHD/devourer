@@ -295,6 +295,7 @@ void RtlJaguar2Device::start_pwrtrack() {
     /* ~2 s cadence via steady_clock, polled in short slices so the dtor join
      * returns promptly on shutdown. */
     auto next = std::chrono::steady_clock::now();
+    uint64_t skipped = 0;
     while (!_pwrtrack_stop && !g_devourer_should_stop) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       if (std::chrono::steady_clock::now() < next)
@@ -308,11 +309,14 @@ void RtlJaguar2Device::start_pwrtrack() {
       int cck = -1, ofdm = -1, mcs7 = -1;
       _hal.txagc_shadow(cck, ofdm, mcs7);
       /* Same hazard as the DIG thread: a register read that throws under RX
-       * load must skip this tick, not terminate the process. */
+       * load must skip this tick, not terminate the process. Counted and
+       * rate-limited the same way. */
       try {
         _cal->pwr_track(ofdm);
       } catch (const std::exception &e) {
-        _logger->warn("Jaguar2 thermal track: tick skipped ({})", e.what());
+        if (skipped++ % 100 == 0)
+          _logger->warn("Jaguar2 thermal track: tick skipped after a failed "
+                        "register access ({}), {} so far", e.what(), skipped);
       }
     }
   });
@@ -510,6 +514,8 @@ void RtlJaguar2Device::ClearAmpduMode() { SetAmpduMode(devourer::AmpduMode{}); }
 
 void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+  _rx_stop = false;
+
   /* A window armed before a (re-)bring-up describes a chip state that no
    * longer exists; leaving it armed would make the next unrelated
    * GetChannelBusy() take the armed branch and report a stale period. */
@@ -590,13 +596,28 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> lk(_reg_mu);
     _station_ready = true; /* every port-0 write of this bring-up is done */
   }
-  StartRxLoop(std::move(packetProcessor));
+  start_rx_loop(std::move(packetProcessor), false);
 }
 
 void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
+  start_rx_loop(std::move(packetProcessor), true);
+}
+
+void RtlJaguar2Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale) {
+  /* A signal has already landed: skip the setup below rather than build it
+   * for a loop whose own predicate would exit on its first pass. */
+  if (g_devourer_should_stop)
+    return;
+
   _packetProcessor = std::move(packetProcessor);
-  /* Restartable: clear any stop request left by a prior StopRxLoop(). */
-  _rx_stop = false;
+
+  if (clear_stale) {
+    _rx_stop = false;
+  } else if (_rx_stop) {
+    /* Stop requested during Init must prevent its receive loop from starting */
+    return;
+  }
+
   /* Start the DIG thread: track IGI to the false-alarm rate so weak signals are
    * caught without an FA storm (a fixed IGI can't span the range). */
   _dig_stop = false;
@@ -629,6 +650,8 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       _device, _logger, devourer::tonemask::Family::AC2_8822B, _channel, 2,
       _cfg.rx.csi_mask ? _cfg.rx.csi_mask->c_str() : nullptr,
       _cfg.rx.nbi ? _cfg.rx.nbi->c_str() : nullptr);
+  if (_cfg.rx.csi_mask || _cfg.rx.nbi)
+    _hal.note_tone_mask_armed();
 
   _logger->info("RtlJaguar2Device: entering RX loop (ch={})", _channel.Channel);
 
@@ -711,9 +734,9 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * C2H pkt 0xFF/0x0F carries per-frame delivery + retry count —
          * decode + emit tx.report (src/TxReport.h). */
         if (is_c2h && devourer::is_ccx_halmac(f.frame, f.frame_len))
-          devourer::emit_tx_report(
-              _logger->events(),
-              devourer::parse_ccx_halmac(f.frame, f.frame_len), "halmac");
+          DeliverTxReport(_logger->events(),
+                          devourer::parse_ccx_halmac(f.frame, f.frame_len),
+                          "halmac");
         /* Per-frame RSSI/SNR/EVM from the jgr2 PHY-status (present when
          * APP_PHYSTS is on, i.e. drvinfo carries the 32-byte report). CCK rates
          * (DESC_RATE1M..11M = 0..3) use type0, everything else type1. C2H has no
@@ -1356,6 +1379,9 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
   c.station_mode_ok = _variant == jaguar2::ChipVariant::C8822B;
   c.hw_rx_timestamp = true;  /* FrameParserJaguar2 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
+  /* Measured on the 8822B die only (an 8812BU: injected 0x50/0x80 stamped,
+   * 34 µs spread); the 8821C runs the same code with no cell. */
+  c.hw_injected_mgmt_txtsf = _variant == jaguar2::ChipVariant::C8822B;
   c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822B readback) */
   c.xtal_cap_max = 0x3f; /* 6-bit AFE crystal-cap trim (0x24/0x28) */
   c.xtal_cap_default = _hal.efuse_logical_byte(0xB9) == 0xFF

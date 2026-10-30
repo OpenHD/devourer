@@ -53,6 +53,10 @@ public:
    * runs this on its own std::thread next to the TX loop. Starts (and on exit
    * stops) the DIG thread — TX-only sessions stay DIG-free. */
   void StartRxLoop(Action_ParsedRadioPacket packetProcessor) override;
+  std::optional<uint8_t> NextTxReportTag() const override {
+    if (!_cfg.tx.report) return std::nullopt;
+    return static_cast<uint8_t>(_tx_rpt_tag.load(std::memory_order_relaxed) & 0xff);
+  }
   void StopRxLoop() override { _rx_stop = true; }
   void SetMonitorChannel(SelectedChannel channel) override;
   /* Lean frequency-hop retune (the Jaguar2 port of the Jaguar1 FastRetune —
@@ -413,6 +417,8 @@ private:
   /* StartRxLoop stop request (StopRxLoop). volatile (not atomic) to match the
    * signal-flag pattern used across the library (g_devourer_should_stop). */
   volatile bool _rx_stop = false;
+
+  void start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale);
 
   /* Shared cold bring-up (power-on -> DLFW -> MAC/BB/RF -> channel -> LCK ->
    * IQK -> coex -> enable RX/TX engine). Used by both Init (RX) and InitWrite

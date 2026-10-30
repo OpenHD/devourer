@@ -191,7 +191,35 @@ struct AdapterCaps {
    * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
    * inherits its row), 8733B (1725/1725 frames ACKed at retries_mean 0.00,
    * and retarget-proof: re-armed on a different MAC, 1728/1728 —
-   * tests/ack_txreport_matrix.sh run with the 8733B as the responder).
+   * tests/ack_txreport_matrix.sh run with the 8733B as the responder),
+   * 8852B (Kestrel has no CCX report, so the soliciting TX is an 8832CU
+   * counting the ACK frames it receives, one attempt per frame, MCS1 on
+   * ch161, 3 runs per row, responder on its own macid 127 / ADDR_CAM entry
+   * 127: 14414/14422 armed at Init, 14376/14417 armed at InitWrite,
+   * 14419/14432 retargeted, 0/6597 at the old address after the retarget,
+   * 0/6575 never armed, 0/6561 after a live disarm, re-run with the
+   * solicitor across the disarm: 3842/3848 then 0/1773; one cell in about 55
+   * across the development runs, at entry 1, read the entry back committed
+   * and answered no ACKs, not reproduced since), 8852C (the same bench with
+   * the roles swapped, the 8852B soliciting; the entry is host-written at
+   * macid / ADDR_CAM entry 63, docs/kestrel-ack-responder.md. 3 runs per row
+   * with the entry at hardware entry 126, an earlier layout that used the
+   * 8852B's CAM stride: 13831/14041 armed at Init, 14239/14408 retargeted,
+   * armed at InitWrite 98.9% and 97.0% in two runs with the third a dead
+   * session, 0/5993 at the old address, 0/6062 never armed. At hardware
+   * entry 63, the solicitor running across a live disarm in one session:
+   * 3812/3837 then 0/1616, 3846/3848 then 0/1623 (a third cell was a dead
+   * session and says nothing). Some bring-ups used to answer no ACK at all:
+   * the TX path selection the MAC attached to the ACK was uninitialised. The
+   * dead rate drifts through a day, so with times (2026-10-15, UTC-3):
+   * without the fix 6 of 15 at 10:12-10:19, 10 of 104 at 12:51-14:45 and
+   * 4 of 30 at 16:15-16:31 (plus 3 of 12 on an earlier day, time not
+   * recorded; up to ~85% on a second bench in the afternoon); with the path selection taken from the BB's
+   * P-MAC registers (docs/kestrel-ack-responder.md) 0 dead of 93 at
+   * 14:47-16:04 and 0 of 30 at 17:27-17:43, every session 96.8-100%, and 0
+   * of 20 on the second bench an hour after its ~85% series; solicitor
+   * across a live disarm 3791/3845 then 0/1602 and 3829/3843 then 0/1639,
+   * never armed 0/1591, at 17:44-17:46).
    *
    * The `on`, `retarget`, and legacy `off` rows establish arming, retargeting,
    * and a never-armed control. A backend-owned `disarmed` row supports only
@@ -216,8 +244,7 @@ struct AdapterCaps {
    * generation — the AP-mode work proved the gate where it was measured.
    * False-as-unmeasured (the
    * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
-   * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:
-   * SetAckResponder is not implemented on the AX generation.
+   * the recipe but no 8821CU/CE cell has run.
    * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
    * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; the 8733B
    * by airtime dose-response instead, 0/3/12 -> 1.00/4.00/12.32–12.33 airings per
@@ -267,16 +294,11 @@ struct AdapterCaps {
    *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
    *     and hardware key lookup are untested;
    *   - those cells did not drive SetStationIdentity itself. On this part the
-   *     seam writes no register, so the measured hardware state is the state
-   *     a successful arm leaves behind, but the literal "arm through IRadio,
+   *     seam writes no identity register and installs the managed receive
+   *     filter the cells ran (0x00015f97; the RX loop's monitor filter comes
+   *     back on clear), so the measured hardware state is the state a
+   *     successful arm leaves behind, but the literal "arm through IRadio,
    *     then measure" path is not what the cells ran;
-   *   - the cells ran the MANAGED receive filter, and the library's own RX
-   *     path does not: Mt7612uRadio::StartRxLoop calls
-   *     mt7612u_set_monitor_rx() unconditionally, so a station driven through
-   *     IRadio runs PROMISCUOUS. Acknowledgement does not depend on it (a
-   *     monitor-filter run of the same auto-ACK cell also read 100%), but the
-   *     "moving the port identity makes a station deaf" half of the rationale
-   *     is specific to the managed filter;
    *   - two units, one peer model, one channel, near field, no soak; the
    *     second unit reproduced the acknowledgement and uplink cells (its
    *     uplink at 1.9 mean retries against the first unit's 0.0), not the
@@ -418,12 +440,42 @@ struct AdapterCaps {
    * (both word orders, no beacon armed), which is exactly what the Jaguar1
    * WriteTsf writes; the override itself has not run on Jaguar1 hardware. The
    * 8812A/8814A, 8821C (USB and PCIe) and 8822E ride the same pair and code
-   * path and are not separately measured. FALSE on the MT7612U (measured: its DW0/DW1 registers
-   * do not load the counter, docs/mt7612u.md), and on Kestrel and the RTL8733B
-   * (no TSF write in the source — not a bench fact). */
+   * path and are not separately measured. Kestrel: true over PCIe (RTL8852CE,
+   * readback against the FREERUN counter: +30000 µs -> +29998), false over USB
+   * (unmeasured). FALSE on the MT7612U (measured: its DW0/DW1 registers
+   * do not load the counter, docs/mt7612u.md), and on the RTL8733B (no TSF
+   * write in the source — not a bench fact).
+   *
+   * tbtt_follows_tsf: an active hardware beacon's TBTT moves with a WriteTsf
+   * (the TBTT is hardware-locked to the TSF grid), so disciplining the TSF
+   * steers the beacon — the actuator tests/pcie_ptp_tsf_discipline.cpp needs.
+   * Measured on air through WriteTsf on the RTL8852CE (Kestrel, PCIe). FALSE on
+   * Jaguar2/3, whose TBTT is deaf to a TSF write (measured — use
+   * PinBeaconTbtt there), and left false on Jaguar1: its TBTT is recorded as
+   * TSF-locked from the PinBeaconTbtt bench, but not measured through
+   * WriteTsf.
+   *
+   * hw_injected_mgmt_txtsf: the MAC ALSO overwrites the timestamp field of a
+   * management frame the HOST injects through send_packet (a probe response or
+   * a beacon-shaped frame) with its live egress TSF, so a caller can air an
+   * egress-stamped frame on any channel at any time without the hardware
+   * beacon function. Measured with a constant in the field and an independent
+   * witness reading it back (tests/probe_resp_egress_tsf_check.sh): true on
+   * the Jaguar2 8822B die (8812BU), Jaguar3 (8812CU, 8812EU) and the Kestrel
+   * 8852C die (8832CU), both FC 0x50 and 0x80, arrival−egress spread 34–41 µs
+   * over 15 s; the 8821C and 8852B dies are unmeasured and stay false. FALSE
+   * on Jaguar1:
+   * the 8821AU rewrites the field, but with a free-running counter that is
+   * neither TSF port (both read live during the run) and repeats for ~7
+   * frames at a time; its hardware TBTT beacon IS stamped (3.2 µs spread), so
+   * on this family the egress pair rides StartBeacon. The 8812AU/8814AU are
+   * unmeasured and inherit false. False on the RTL8733B (no TSF read, no
+   * beacon) and the MT7612U (unmeasured). */
   bool hw_rx_timestamp = false;
   bool hw_beacon_txtsf = false;
+  bool hw_injected_mgmt_txtsf = false;
   bool tsf_write_ok = false;
+  bool tbtt_follows_tsf = false;
   /* 802.11ax scheduled UL (Kestrel/RTL8852 only). trigger_ul_ok: the adapter
    * can air an HE Trigger frame (UL-OFDMA grant) and program the fw UL-OFDMA
    * scheduler (SendTrigger / ConfigureUlOfdma). twt_ok: the fw exposes the TWT

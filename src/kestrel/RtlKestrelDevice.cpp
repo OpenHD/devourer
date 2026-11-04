@@ -1094,6 +1094,36 @@ bool RtlKestrelDevice::StartBeacon(const uint8_t *beacon, size_t len,
   return ok;
 }
 
+bool RtlKestrelDevice::SetBeaconBackoff(bool random) {
+  if (!_tx_up) {
+    _logger->error("Kestrel: SetBeaconBackoff before InitWrite");
+    return false;
+  }
+  if (!_hal.set_beacon_backoff(random)) {
+    _logger->error("Kestrel: SetBeaconBackoff({}) register write failed", random);
+    return false;
+  }
+  _logger->info("Kestrel: beacon backoff {}", random
+                    ? "random (EDCA CW 3..7, AIFS 25 us)"
+                    : "OFF (fixed AIFS 25 us after TBTT)");
+  return true;
+}
+
+bool RtlKestrelDevice::ReadTsfAndFreeRun(uint64_t &tsf, uint64_t &freerun) {
+  namespace r = kestrel::reg;
+  tsf = ReadTsf();
+  uint32_t hi = _device.rtw_read32(r::R_AX_FREERUN_CNT_HIGH);
+  uint32_t lo = _device.rtw_read32(r::R_AX_FREERUN_CNT_LOW);
+  const uint32_t hi2 = _device.rtw_read32(r::R_AX_FREERUN_CNT_HIGH);
+  if (hi2 != hi) {
+    hi = hi2;
+    lo = _device.rtw_read32(r::R_AX_FREERUN_CNT_LOW);
+  }
+  freerun = (static_cast<uint64_t>(hi) << 32) | lo;
+  /* A dead device reads all-ones on both. */
+  return !(hi == 0xFFFFFFFFu && lo == 0xFFFFFFFFu);
+}
+
 bool RtlKestrelDevice::WriteTsf(uint64_t tsf) {
   namespace r = kestrel::reg;
   if (_device.is_usb())
@@ -1332,6 +1362,8 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
   /* ...and the AX TBTT is hardware-locked to that TSF: a WriteTsf moves an
    * active beacon's TBTT with it (on-air, tests/kestrel_tbtt_probe.cpp). */
   c.tbtt_follows_tsf = !_device.is_usb();
+  /* The beacon-queue EDCA is a plain MAC register on both buses. */
+  c.beacon_backoff_ctl = true;
   c.xtal_cap_default = _efuse.xtal_cap; /* efuse crystal-cap (no runtime trim wired) */
   devourer::set_standard_freq_ranges(c);
 

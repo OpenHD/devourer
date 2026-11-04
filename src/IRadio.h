@@ -507,6 +507,19 @@ public:
    * docs/time-distribution.md. */
   virtual bool WriteTsf(uint64_t tsf) { (void)tsf; return false; }
 
+  /* Read the port TSF and a free-running µs counter that WriteTsf never
+   * moves, back to back (Kestrel: R_AX_FREERUN_CNT). tsf - freerun is then the
+   * TSF's exact offset, including every step ever applied, so a controller
+   * that steps the TSF can fit its reference against the free-running counter
+   * instead of booking the steps it believes it applied (a read-add-write lands
+   * a few µs off, varying with host scheduling). The two reads are a few MMIO
+   * reads apart, which is a constant bias. False where unsupported (default). */
+  virtual bool ReadTsfAndFreeRun(uint64_t &tsf, uint64_t &freerun) {
+    (void)tsf;
+    (void)freerun;
+    return false;
+  }
+
   /* Load a beacon into the beacon reserved-page + enable the MAC beacon function,
    * so the chip AUTO-TRANSMITS it at each TBTT — hardware-timed and
    * hardware-TSF-stamped (the MAC inserts the live 64-bit TSF into the beacon
@@ -551,6 +564,20 @@ public:
    * failure must be retried (or followed by hardware shutdown) before its
    * shared port is reused. */
   virtual bool StopBeacon() { return false; }
+
+  /* Random backoff for the hardware beacon (default true: the vendor EDCA,
+   * which spreads each beacon over AIFS + 0..CW slots after its TBTT so that
+   * uncoordinated co-channel APs don't collide on every beacon). false makes
+   * the departure deterministic: a fixed AIFS after the TBTT. That is right only
+   * when co-channel cells' TBTTs are coordinated (staggered by a schedule, as
+   * a scheduled RAN does) — two uncoordinated APs with the backoff off and
+   * coinciding TBTTs collide every beacon. Persists until changed, including
+   * across a re-init. Check AdapterCaps::beacon_backoff_ctl; returns false where
+   * unsupported (default). */
+  virtual bool SetBeaconBackoff(bool random) {
+    (void)random;
+    return false;
+  }
 
   /* Disable / restore the MAC carrier-sense gate that defers TX — both primary
    * CCA (0x520[14], carrier-sense of a decodable preamble) and EDCCA (0x520[15],

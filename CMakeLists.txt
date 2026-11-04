@@ -656,6 +656,21 @@ if(DEVOURER_PCIE)
     )
     target_link_libraries(beacon_phase_observer PUBLIC devourer)
 endif()
+# M0 contract probes (docs/scheduled-mac.md), USB or PCIe through
+# examples/common/radio_open.h (DEVOURER_PCIE_BDF selects the vfio radio).
+# POSIX bench tools (unistd.h / _exit), so not on Windows.
+if(NOT WIN32)
+foreach(m0probe dl_departure_tx txegress_witness beacon_update_probe ue_rx_probe)
+    add_executable(${m0probe}
+        tests/${m0probe}.cpp
+        examples/common/env_config.cpp
+    )
+    target_include_directories(${m0probe} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/tdma)
+    target_link_libraries(${m0probe} PUBLIC devourer)
+endforeach()
+endif()
 
 # kestrelprobe — staged USB bring-up prober for the Kestrel (RTL8852B/C):
 # AX identity (die-id/cut) -> power-on + EFUSE -> firmware download, the
@@ -1631,6 +1646,51 @@ target_link_libraries(UeRxAttributionSelftest PRIVATE devourer)
 
 add_test(NAME ue_rx_attribution_derive COMMAND UeRxAttributionSelftest)
 
+# Headless guard for the M1 cell core (src/cell/SlotGrid.h, GrantMap.h):
+# airtime + slot budget, fixed-grid phase math, grant-map IE round trip and
+# rejects, the receiver's epoch / effective-superframe rules.
+add_executable(CellSelftest
+    tests/cell_selftest.cpp
+)
+target_link_libraries(CellSelftest PRIVATE devourer)
+add_test(NAME cell_core COMMAND CellSelftest)
+
+# Headless guard for the M1 cell node's pure logic (examples/cell/cell.h).
+add_executable(CellNodeSelftest
+    tests/cell_node_selftest.cpp
+)
+target_link_libraries(CellNodeSelftest PRIVATE devourer)
+target_include_directories(CellNodeSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
+add_test(NAME cell_node COMMAND CellNodeSelftest)
+
+# cell — the M1 (#255) reference DU / UE / witness node (examples/cell/main.cpp).
+# POSIX bench tool like the M0 probes (radio_open.h), so not on Windows.
+if(NOT WIN32)
+    add_executable(cell
+        examples/cell/main.cpp
+        examples/common/env_config.cpp
+    )
+    target_link_libraries(cell PUBLIC devourer)
+    target_include_directories(cell PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
+    # CELL_PSK tags the scheduling frames with HMAC-SHA1 (cell.h CellMac takes
+    # the primitive injected); without OpenSSL the cell runs unauthenticated.
+    if(OpenSSL_FOUND)
+        target_link_libraries(cell PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(cell PRIVATE DEVOURER_CELL_OPENSSL=1)
+    endif()
+endif()
+
+# Headless guard for the M2 cell core (src/cell/Harq.h, LinkAdapt.h): HARQ
+# receiver dedup/window, sender ACK/NACK/timeout/attempt limit/span, a lossy-
+# channel HARQ-vs-baseline simulation, and the link-adaptation rate rules.
+add_executable(CellM2Selftest
+    tests/cell_m2_selftest.cpp
+)
+target_link_libraries(CellM2Selftest PRIVATE devourer)
+add_test(NAME cell_m2 COMMAND CellM2Selftest)
+
 # Headless guard for the TsfSync one-way time-distribution fit (src/TsfSync.h):
 # skew/offset recovery from beacon {egress, arrival} TSF pairs, clock
 # translation, the local 32-bit TSF wrap, and the Packet::TxEgressTsf pick.
@@ -1817,6 +1877,15 @@ if(Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/la_csi.py --selftest
     )
     set_tests_properties(la_csi_math PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Headless guard for the M1 cell KPI analysis (tests/cell_2ue_analyze.py):
+    # a synthetic in-slot run passes; a UE uplink moved into the other UE's
+    # slot is flagged out-of-slot and as an overlap; a missed uplink counts.
+    add_test(
+        NAME cell_2ue_analyze
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/cell_2ue_analyze.py --selftest
+    )
 
     # Headless guard for the 2.4 GHz-VHT waterfall's decode + crossing math
     # (tests/nitroqam_waterfall.py). The DESC_RATE decode is what proves which

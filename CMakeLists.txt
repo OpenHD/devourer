@@ -1655,6 +1655,25 @@ add_executable(CellSelftest
 target_link_libraries(CellSelftest PRIVATE devourer)
 add_test(NAME cell_core COMMAND CellSelftest)
 
+# Headless guard for the M4 cell core (src/cell/TsfDiscipline.h,
+# SyncHealth.h): the discipline loop against a simulated radio + PHC (true
+# on-air TBTT phase), its bracket filter / write-failure re-anchor / ledger
+# axis, and the lock / degrade / lose / recover rules.
+add_executable(CellM4Selftest
+    tests/cell_m4_selftest.cpp
+)
+target_link_libraries(CellM4Selftest PRIVATE devourer)
+add_test(NAME cell_m4 COMMAND CellM4Selftest)
+
+# Headless guard for the M5 cell core (src/cell/Coord.h, F1.h): the CU's
+# coordination planner on the rig layout and random scenarios, the F1
+# messages (round trips, tags, malformed input) and the DU's failure model.
+add_executable(CellM5Selftest
+    tests/cell_m5_selftest.cpp
+)
+target_link_libraries(CellM5Selftest PRIVATE devourer)
+add_test(NAME cell_m5 COMMAND CellM5Selftest)
+
 # Headless guard for the M1 cell node's pure logic (examples/cell/cell.h).
 add_executable(CellNodeSelftest
     tests/cell_node_selftest.cpp
@@ -1674,11 +1693,27 @@ if(NOT WIN32)
     target_include_directories(cell PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
-    # CELL_PSK tags the scheduling frames with HMAC-SHA1 (cell.h CellMac takes
-    # the primitive injected); without OpenSSL the cell runs unauthenticated.
+    # CELL_PSK authenticates the cell with HMAC-SHA1 — the scheduling-frame
+    # tags (cell.h CellMac) and the M3 RACH (src/cell/Rach.h) both take the
+    # primitive injected. Without OpenSSL the cell runs unauthenticated and
+    # cannot RACH.
     if(OpenSSL_FOUND)
         target_link_libraries(cell PRIVATE OpenSSL::Crypto)
         target_compile_definitions(cell PRIVATE DEVOURER_CELL_OPENSSL=1)
+    endif()
+endif()
+
+# ran-controller — the M5 (#259) CU (tools/ran-controller/main.cpp): F1
+# reports in, src/cell/Coord.h plans, schedules out. Header-only on the
+# library side: it never opens a radio, so it builds without libusb on a
+# controller host. POSIX sockets, so not on Windows.
+if(NOT WIN32)
+    add_executable(ran-controller tools/ran-controller/main.cpp)
+    target_include_directories(ran-controller PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(ran-controller PRIVATE cxx_std_20)
+    if(OpenSSL_FOUND)
+        target_link_libraries(ran-controller PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(ran-controller PRIVATE DEVOURER_CELL_OPENSSL=1)
     endif()
 endif()
 
@@ -1690,6 +1725,15 @@ add_executable(CellM2Selftest
 )
 target_link_libraries(CellM2Selftest PRIVATE devourer)
 add_test(NAME cell_m2 COMMAND CellM2Selftest)
+
+# Headless guard for the M3 cell core (src/cell/Rach.h, UeRegistry.h): the
+# pool, the msgA/msgB formats and their auth/freshness rejects, duplicates,
+# exhaustion, the client's backoff rules, and a multi-UE contention run.
+add_executable(CellM3Selftest
+    tests/cell_m3_selftest.cpp
+)
+target_link_libraries(CellM3Selftest PRIVATE devourer)
+add_test(NAME cell_m3 COMMAND CellM3Selftest)
 
 # Headless guard for the TsfSync one-way time-distribution fit (src/TsfSync.h):
 # skew/offset recovery from beacon {egress, arrival} TSF pairs, clock
@@ -1885,6 +1929,15 @@ if(Python3_Interpreter_FOUND)
         NAME cell_2ue_analyze
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/cell_2ue_analyze.py --selftest
+    )
+
+    # Headless guard for the M5 coordination KPIs (tests/ran_coord_analyze.py):
+    # a synthetic planned run passes; the uncoordinated one (a DL on the other
+    # cell's beacon) fails on delivery and on witness cross-cell overlaps.
+    add_test(
+        NAME ran_coord_analyze
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ran_coord_analyze.py --selftest
     )
 
     # Headless guard for the 2.4 GHz-VHT waterfall's decode + crossing math

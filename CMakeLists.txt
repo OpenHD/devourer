@@ -656,6 +656,21 @@ if(DEVOURER_PCIE)
     )
     target_link_libraries(beacon_phase_observer PUBLIC devourer)
 endif()
+# M0 contract probes (docs/scheduled-mac.md), USB or PCIe through
+# examples/common/radio_open.h (DEVOURER_PCIE_BDF selects the vfio radio).
+# POSIX bench tools (unistd.h / _exit), so not on Windows.
+if(NOT WIN32)
+foreach(m0probe dl_departure_tx txegress_witness beacon_update_probe ue_rx_probe)
+    add_executable(${m0probe}
+        tests/${m0probe}.cpp
+        examples/common/env_config.cpp
+    )
+    target_include_directories(${m0probe} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/tdma)
+    target_link_libraries(${m0probe} PUBLIC devourer)
+endforeach()
+endif()
 
 # kestrelprobe — staged USB bring-up prober for the Kestrel (RTL8852B/C):
 # AX identity (die-id/cut) -> power-on + EFUSE -> firmware download, the
@@ -1223,6 +1238,12 @@ target_link_libraries(TxQuiesceSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME tx_quiesce_seam COMMAND TxQuiesceSelftest)
 
+if(DEVOURER_JAGUAR1)
+    add_executable(Jaguar1TxPowerWriteSelftest tests/jaguar1_txpower_write_selftest.cpp)
+    target_link_libraries(Jaguar1TxPowerWriteSelftest PRIVATE devourer PkgConfig::libusb)
+    add_test(NAME jaguar1_txpower_writes COMMAND Jaguar1TxPowerWriteSelftest)
+endif()
+
 # Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
 # the gate-only clear staying gate-only, and the retarget seam. This test does
 # not model silicon or instantiate Rtl8733bDevice; those are covered by the
@@ -1625,6 +1646,95 @@ target_link_libraries(UeRxAttributionSelftest PRIVATE devourer)
 
 add_test(NAME ue_rx_attribution_derive COMMAND UeRxAttributionSelftest)
 
+# Headless guard for the M1 cell core (src/cell/SlotGrid.h, GrantMap.h):
+# airtime + slot budget, fixed-grid phase math, grant-map IE round trip and
+# rejects, the receiver's epoch / effective-superframe rules.
+add_executable(CellSelftest
+    tests/cell_selftest.cpp
+)
+target_link_libraries(CellSelftest PRIVATE devourer)
+add_test(NAME cell_core COMMAND CellSelftest)
+
+# Headless guard for the M4 cell core (src/cell/TsfDiscipline.h,
+# SyncHealth.h): the discipline loop against a simulated radio + PHC (true
+# on-air TBTT phase), its bracket filter / write-failure re-anchor / ledger
+# axis, and the lock / degrade / lose / recover rules.
+add_executable(CellM4Selftest
+    tests/cell_m4_selftest.cpp
+)
+target_link_libraries(CellM4Selftest PRIVATE devourer)
+add_test(NAME cell_m4 COMMAND CellM4Selftest)
+
+# Headless guard for the M5 cell core (src/cell/Coord.h, F1.h): the CU's
+# coordination planner on the rig layout and random scenarios, the F1
+# messages (round trips, tags, malformed input) and the DU's failure model.
+add_executable(CellM5Selftest
+    tests/cell_m5_selftest.cpp
+)
+target_link_libraries(CellM5Selftest PRIVATE devourer)
+add_test(NAME cell_m5 COMMAND CellM5Selftest)
+
+# Headless guard for the M1 cell node's pure logic (examples/cell/cell.h).
+add_executable(CellNodeSelftest
+    tests/cell_node_selftest.cpp
+)
+target_link_libraries(CellNodeSelftest PRIVATE devourer)
+target_include_directories(CellNodeSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
+add_test(NAME cell_node COMMAND CellNodeSelftest)
+
+# cell — the M1 (#255) reference DU / UE / witness node (examples/cell/main.cpp).
+# POSIX bench tool like the M0 probes (radio_open.h), so not on Windows.
+if(NOT WIN32)
+    add_executable(cell
+        examples/cell/main.cpp
+        examples/common/env_config.cpp
+    )
+    target_link_libraries(cell PUBLIC devourer)
+    target_include_directories(cell PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
+    # CELL_PSK authenticates the cell with HMAC-SHA1 — the scheduling-frame
+    # tags (cell.h CellMac) and the M3 RACH (src/cell/Rach.h) both take the
+    # primitive injected. Without OpenSSL the cell runs unauthenticated and
+    # cannot RACH.
+    if(OpenSSL_FOUND)
+        target_link_libraries(cell PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(cell PRIVATE DEVOURER_CELL_OPENSSL=1)
+    endif()
+endif()
+
+# ran-controller — the M5 (#259) CU (tools/ran-controller/main.cpp): F1
+# reports in, src/cell/Coord.h plans, schedules out. Header-only on the
+# library side: it never opens a radio, so it builds without libusb on a
+# controller host. POSIX sockets, so not on Windows.
+if(NOT WIN32)
+    add_executable(ran-controller tools/ran-controller/main.cpp)
+    target_include_directories(ran-controller PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(ran-controller PRIVATE cxx_std_20)
+    if(OpenSSL_FOUND)
+        target_link_libraries(ran-controller PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(ran-controller PRIVATE DEVOURER_CELL_OPENSSL=1)
+    endif()
+endif()
+
+# Headless guard for the M2 cell core (src/cell/Harq.h, LinkAdapt.h): HARQ
+# receiver dedup/window, sender ACK/NACK/timeout/attempt limit/span, a lossy-
+# channel HARQ-vs-baseline simulation, and the link-adaptation rate rules.
+add_executable(CellM2Selftest
+    tests/cell_m2_selftest.cpp
+)
+target_link_libraries(CellM2Selftest PRIVATE devourer)
+add_test(NAME cell_m2 COMMAND CellM2Selftest)
+
+# Headless guard for the M3 cell core (src/cell/Rach.h, UeRegistry.h): the
+# pool, the msgA/msgB formats and their auth/freshness rejects, duplicates,
+# exhaustion, the client's backoff rules, and a multi-UE contention run.
+add_executable(CellM3Selftest
+    tests/cell_m3_selftest.cpp
+)
+target_link_libraries(CellM3Selftest PRIVATE devourer)
+add_test(NAME cell_m3 COMMAND CellM3Selftest)
+
 # Headless guard for the TsfSync one-way time-distribution fit (src/TsfSync.h):
 # skew/offset recovery from beacon {egress, arrival} TSF pairs, clock
 # translation, the local 32-bit TSF wrap, and the Packet::TxEgressTsf pick.
@@ -1812,6 +1922,24 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(la_csi_math PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Headless guard for the M1 cell KPI analysis (tests/cell_2ue_analyze.py):
+    # a synthetic in-slot run passes; a UE uplink moved into the other UE's
+    # slot is flagged out-of-slot and as an overlap; a missed uplink counts.
+    add_test(
+        NAME cell_2ue_analyze
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/cell_2ue_analyze.py --selftest
+    )
+
+    # Headless guard for the M5 coordination KPIs (tests/ran_coord_analyze.py):
+    # a synthetic planned run passes; the uncoordinated one (a DL on the other
+    # cell's beacon) fails on delivery and on witness cross-cell overlaps.
+    add_test(
+        NAME ran_coord_analyze
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ran_coord_analyze.py --selftest
+    )
+
     # Headless guard for the 2.4 GHz-VHT waterfall's decode + crossing math
     # (tests/nitroqam_waterfall.py). The DESC_RATE decode is what proves which
     # modulation a frame actually arrived as, and a bench link that tops out
@@ -1845,6 +1973,28 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(mt7612u_initvals_generated PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+foreach(thread_variant Native Fallback)
+    add_executable(CancellableThread${thread_variant}Selftest tests/cancellable_thread_selftest.cpp)
+    target_include_directories(CancellableThread${thread_variant}Selftest PRIVATE src)
+    target_compile_features(CancellableThread${thread_variant}Selftest PRIVATE cxx_std_20)
+    target_link_libraries(CancellableThread${thread_variant}Selftest PRIVATE Threads::Threads)
+    if(thread_variant STREQUAL "Fallback")
+        target_compile_definitions(CancellableThread${thread_variant}Selftest PRIVATE DEVOURER_FORCE_THREAD_FALLBACK)
+    endif()
+    add_test(NAME cancellable_thread_${thread_variant} COMMAND CancellableThread${thread_variant}Selftest)
+    set_tests_properties(cancellable_thread_${thread_variant} PROPERTIES TIMEOUT 10)
+endforeach()
+
+add_executable(PacketSpanSelftest tests/packet_span_selftest.cpp)
+target_include_directories(PacketSpanSelftest PRIVATE src)
+target_compile_features(PacketSpanSelftest PRIVATE cxx_std_20)
+add_test(NAME packet_span_native COMMAND PacketSpanSelftest)
+add_executable(PacketSpanFallbackSelftest tests/packet_span_selftest.cpp)
+target_include_directories(PacketSpanFallbackSelftest PRIVATE src)
+target_compile_features(PacketSpanFallbackSelftest PRIVATE cxx_std_17)
+target_compile_definitions(PacketSpanFallbackSelftest PRIVATE DEVOURER_FORCE_PACKET_SPAN_FALLBACK)
+add_test(NAME packet_span_fallback COMMAND PacketSpanFallbackSelftest)
 
 # --- selftest aggregate ----------------------------------------------------
 # `cmake --build build --target selftests` builds every headless test binary in

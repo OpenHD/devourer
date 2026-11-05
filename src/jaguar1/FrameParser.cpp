@@ -154,7 +154,7 @@ __inline static u32 _RND8(u32 sz) {
   return val;
 }
 
-std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
+std::vector<Packet> FrameParser::recvbuf2recvframe(devourer::PacketSpan<uint8_t> ptr) {
   auto pbuf = ptr;
   auto pkt_cnt = GET_RX_STATUS_DESC_USB_AGG_PKTNUM_8812(pbuf.data());
   //_logger->info("pkt_cnt == {}", pkt_cnt);

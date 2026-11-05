@@ -1,3 +1,4 @@
+#include "CancellableThread.h"
 #include "RtlJaguarDevice.h"
 #include "jaguar1/BeaconPort.h"
 #include "BeamformingSounder.h"
@@ -1750,7 +1751,7 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
    * immediately after completed bring-up rather than before SetAckResponder.
    * Its local lifetime also makes exceptional/normal RX-loop exit cancel and
    * join an outstanding long-delay request. */
-  std::jthread ack_disarm_thread;
+  devourer::CancellableThread ack_disarm_thread;
   std::optional<uint32_t> ack_disarm_after_ms;
   {
     std::lock_guard<std::recursive_mutex> lock(_port0_mu);
@@ -1763,8 +1764,8 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
                      "ACK arm to associate with the delayed clear");
     } else {
       const uint64_t arm_generation = *configured_arm_generation;
-      ack_disarm_thread = std::jthread(
-        [this, delay_ms, arm_generation](std::stop_token stop) {
+      ack_disarm_thread = devourer::CancellableThread(
+        [this, delay_ms, arm_generation](devourer::StopToken stop) {
           const auto deadline = std::chrono::steady_clock::now() +
                                 std::chrono::milliseconds(delay_ms);
           while (!stop.stop_requested() &&
@@ -1953,7 +1954,7 @@ void RtlJaguarDevice::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bo
     cfo_tick();
     FrameParser fp{_logger};
     for (auto &p : fp.recvbuf2recvframe(
-             std::span<uint8_t>{const_cast<uint8_t *>(data), (size_t)n})) {
+             devourer::PacketSpan<uint8_t>{const_cast<uint8_t *>(data), (size_t)n})) {
       if (should_stop || g_devourer_should_stop)
         break;
       /* physt: the descriptor says the PHY wrote a status report for THIS
@@ -2404,6 +2405,9 @@ devourer::TxPowerState RtlJaguarDevice::GetTxPowerState() {
   s.offset_qdb = static_cast<int16_t>(s.offset_steps * 2);
   s.saturated_low = _radioManagement->TxPowerSaturatedLow();
   s.saturated_high = _radioManagement->TxPowerSaturatedHigh();
+  s.tx_write_status_valid = _brought_up;
+  s.txagc_writes_attempted = _radioManagement->TxPowerWritesAttempted();
+  s.txagc_writes_failed = _radioManagement->TxPowerWritesFailed();
   const bool is_8814 = _eepromManager->version_id.ICType == CHIP_8814A;
   if (_brought_up && !is_8814 && !_cw_active) {
     /* Path-A representative indices straight from the TXAGC registers:
@@ -2427,6 +2431,29 @@ devourer::TxPowerState RtlJaguarDevice::GetTxPowerState() {
     s.hw_readback = false;
   }
   s.rate_diffs_custom = _radioManagement->HasTxPowerRateDiffs();
+  return s;
+}
+
+devourer::TxPowerState RtlJaguarDevice::GetTxPowerDiagnosticState() {
+  auto s = GetTxPowerState();
+  if (s.hw_readback) {
+    s.jaguar1_paths = std::min<uint8_t>(_eepromManager->numTotalRfPath, 2);
+    for (uint8_t p = 0; p < s.jaguar1_paths; ++p) {
+      const uint16_t bank = p == 0 ? 0xc00 : 0xe00;
+      s.jaguar1_mcs03[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x2c, 0xffffffff);
+      s.jaguar1_mcs47[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x30, 0xffffffff);
+      s.jaguar1_training[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x54, 0xffffffff);
+      s.jaguar1_swing[p] =
+          _radioManagement->phy_query_bb_reg_public(bank + 0x1c, 0xffffffff);
+      s.jaguar1_expected_mcs0[p] =
+          _radioManagement->ComputeTxPowerIndex(p, 0x80, 0);
+      s.jaguar1_expected_mcs7[p] =
+          _radioManagement->ComputeTxPowerIndex(p, 0x87, 0);
+    }
+  }
   return s;
 }
 

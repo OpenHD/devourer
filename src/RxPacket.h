@@ -3,7 +3,7 @@
 
 #include <cstdint>
 #include <optional>
-#include <span>
+#include "PacketSpan.h"
 
 /* Parsed RX packet types, shared across chip generations. The per-generation
  * frame parsers (Jaguar1 FrameParser, Jaguar3 FrameParserJaguar3) both produce
@@ -139,7 +139,7 @@ struct Packet
      * and tools/bf_report_decode.py trims those four bytes when decoding
      * beamforming reports (it reads the `fcs` field of the bf.report_raw
      * event to know whether to). */
-    std::span<uint8_t> Data;
+    devourer::PacketSpan<uint8_t> Data;
 
     /* The transmitter's hardware TX-egress TSF, when the frame carries one.
      *

@@ -25,6 +25,7 @@
  * threads spawn; the fields are intentionally unsynchronized. */
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <cctype>
@@ -150,7 +151,10 @@ public:
     Level level() const { return _level; }
 
     /* Diagnostics destination (default stderr). */
-    void set_diag_stream(std::FILE* f) { _diag = f; }
+    void set_diag_stream(std::FILE* f) {
+        std::lock_guard<std::mutex> guard(_diag_mutex);
+        _diag = f ? f : stderr;
+    }
 
     /* The machine event stream (JSON Lines, default stdout) — Event.h. */
     devourer::EventSink& events() { return _events; }
@@ -218,6 +222,7 @@ private:
 #else
         /* One line, one fwrite (FILE* is stream-locked → per-line atomic
          * across threads), then flush so a pipe reader never stalls. */
+        std::lock_guard<std::mutex> guard(_diag_mutex);
         std::string line;
         line.reserve(txt.size() + 16);
         line += "devourer [";
@@ -232,6 +237,7 @@ private:
 
     Level _level = Level::Debug;
     std::FILE* _diag = stderr;
+    std::mutex _diag_mutex;
     devourer::EventSink _events;
 };
 

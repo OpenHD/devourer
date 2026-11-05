@@ -251,12 +251,12 @@ void RtlAdapter::ReadEFuseByte(uint16_t _offset, uint8_t *pbuf) {
   pbuf[0] = (uint8_t)(value32 & 0xff);
 }
 
-void RtlAdapter::phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask,
+bool RtlAdapter::phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask,
                                 uint32_t data) {
-  PHY_SetBBReg8812(regAddr, bitMask, data);
+  return PHY_SetBBReg8812(regAddr, bitMask, data);
 }
 
-void RtlAdapter::PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
+bool RtlAdapter::PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
                                   uint32_t dataOriginal) {
   uint32_t data = dataOriginal;
   if (bitMask != bMaskDWord) {
@@ -267,7 +267,7 @@ void RtlAdapter::PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
            (((dataOriginal << (int)BitShift)) & bitMask);
   }
 
-  rtw_write32(regAddr, data);
+  return rtw_write32(regAddr, data);
 
   /* RTW_INFO("BBW MASK=0x%x Addr[0x%x]=0x%x\n", BitMask, RegAddr, Data); */
 }

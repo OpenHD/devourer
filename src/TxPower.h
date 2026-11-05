@@ -30,6 +30,7 @@
 #define DEVOURER_TX_POWER_H
 
 #include <cstdint>
+#include <array>
 #include <optional>
 
 namespace devourer {
@@ -78,6 +79,18 @@ struct TxPowerState {
   int16_t ofdm_index = -1;
   int16_t mcs7_index = -1;
   bool hw_readback = false;
+  bool tx_write_status_valid = false;
+  uint32_t txagc_writes_attempted = 0;
+  uint32_t txagc_writes_failed = 0;
+  // Diagnostic Jaguar1 A/B snapshots; zero paths means unavailable, not zero
+  // power. Raw TXAGC words cover HT MCS0..7, plus training and BB scaling.
+  uint8_t jaguar1_paths = 0;
+  std::array<uint32_t, 2> jaguar1_mcs03{};
+  std::array<uint32_t, 2> jaguar1_mcs47{};
+  std::array<uint32_t, 2> jaguar1_training{};
+  std::array<uint32_t, 2> jaguar1_swing{};
+  std::array<uint8_t, 2> jaguar1_expected_mcs0{};
+  std::array<uint8_t, 2> jaguar1_expected_mcs7{};
   bool rate_diffs_custom = false; /* A caller-supplied per-rate diff table is
                                     * CONFIGURED (SetTxPowerRateDiffs), not
                                     * necessarily live on the chip right now:

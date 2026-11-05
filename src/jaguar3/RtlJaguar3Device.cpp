@@ -426,7 +426,7 @@ void RtlJaguar3Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, b
          * a caller needs to tell which A-MPDU subframe the report belonged to.
          * `phy` is the local that says which fields are safe to fold. */
         p.RxAtrib.physt = f.physt;
-        p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
+        p.Data = devourer::PacketSpan<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
         if (!p.RxAtrib.crc_err && phy != PhyStsFill::None) {
           _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
           _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,
@@ -2764,6 +2764,10 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
    * HT40 receiver on the lower-40 channel (the `iw 80MHz` + 40 MHz-radiotap
    * equivalent). */
   uint8_t data_sc = 0;
+  // OpenHD keeps management/session keys at 20 MHz on an HT40 radio.
+  // Place them on the primary half so a 20 MHz peer can receive them.
+  if (_channel.ChannelWidth == CHANNEL_WIDTH_40 && bwidth == CHANNEL_WIDTH_20)
+    data_sc = jaguar3::primary20_subchannel(_channel.ChannelOffset);
   if (_channel.ChannelWidth == CHANNEL_WIDTH_80 && bwidth == CHANNEL_WIDTH_40)
     data_sc = 10; /* VHT_DATA_SC_40_LOWER_OF_80MHZ */
 

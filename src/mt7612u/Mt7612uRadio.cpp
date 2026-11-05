@@ -6,7 +6,7 @@
 #include <exception>
 #include <filesystem>
 #include <ios>
-#include <span>
+#include "PacketSpan.h"
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -505,7 +505,7 @@ void Mt7612uRadio::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool 
      * reference stays valid until pop_commit() below. */
     Packet packet{};
     packet.RxAtrib = slot->attrib;
-    packet.Data = std::span<uint8_t>(slot->data.data(), slot->data.size());
+    packet.Data = devourer::PacketSpan<uint8_t>(slot->data.data(), slot->data.size());
     if (_rx_processor)
       _rx_processor(packet);
 

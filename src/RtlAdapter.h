@@ -90,6 +90,7 @@ public:
   void hci_setup() { _transport->hci_setup(); }
   /* PCIe LTR permission (ITransport::ltr_allowed); true on USB. */
   bool ltr_allowed() { return _transport->ltr_allowed(); }
+  void set_rx_max_wait_us(unsigned us) { _transport->set_rx_max_wait_us(us); }
   /* Pipelined register writes — see ITransport::write_batch_begin. */
   void write_batch_begin() { _transport->write_batch_begin(); }
   bool write_batch_end() { return _transport->write_batch_end(); }
@@ -170,7 +171,7 @@ public:
   }
 
   uint8_t efuse_OneByteRead(uint16_t addr, uint8_t *data);
-  void phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask, uint32_t data);
+  bool phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask, uint32_t data);
 
   /* 32-bit-address register write (see ITransport::write32_wide) — the
    * halbb/halrf BB window lives at addr + 0x10000 (wIndex=1 over USB), out of
@@ -219,7 +220,7 @@ public:
 
 private:
   void init_from_transport(const devourer::DeviceConfig &cfg);
-  void PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
+  bool PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
                         uint32_t dataOriginal);
 };
 

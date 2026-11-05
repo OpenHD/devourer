@@ -3,7 +3,7 @@
 
 #include "logger.h"
 #include <cstdint>
-#include <span>
+#include "PacketSpan.h"
 #include <vector>
 
 #include "TxDescBits.h"
@@ -239,7 +239,7 @@ class FrameParser
 
   public:
     FrameParser(Logger_t logger);
-    std::vector<Packet> recvbuf2recvframe(std::span<uint8_t> ptr);
+    std::vector<Packet> recvbuf2recvframe(devourer::PacketSpan<uint8_t> ptr);
 };
 
 struct pkt_attrib

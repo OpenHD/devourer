@@ -193,9 +193,13 @@ bool HalmacJaguar3Fw::send_fw_page(uint16_t pg_addr, const uint8_t *chunk,
     w8(REG_FWHW_TXQ_CTRL + 2, static_cast<uint8_t>(txq2 & ~(1u << 6)));
 
   /* Build [48-byte TX desc][chunk] and bulk-OUT (PLTFM_SEND_RSVD_PAGE). */
-  std::vector<uint8_t> frame(TXDESC_SIZE_8822C + size, 0);
+  // A full USB packet needs a short terminator. Match HALMAC's firmware
+  // padding; DDMA still copies only the original section bytes.
+  const uint32_t wire_size = size +
+      (!beacon_desc && (TXDESC_SIZE_8822C + size) % 512 == 0 ? 1 : 0);
+  std::vector<uint8_t> frame(TXDESC_SIZE_8822C + wire_size, 0);
   uint8_t *d = frame.data();
-  SET_TX_DESC_TXPKTSIZE_8822C(d, size);
+  SET_TX_DESC_TXPKTSIZE_8822C(d, wire_size);
   SET_TX_DESC_OFFSET_8822C(d, static_cast<uint32_t>(TXDESC_SIZE_8822C));
   SET_TX_DESC_QSEL_8822C(d, QSEL_BEACON);
   SET_TX_DESC_USE_RATE_8822C(d, 1);

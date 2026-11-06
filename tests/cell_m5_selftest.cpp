@@ -193,6 +193,7 @@ int main() {
     r.phase_us = 1500;
     r.period_us = 102400;
     r.net_sf = 0x1234567890ull;
+    r.net_off = -17518356000ll;
     r.seq = 0x0102030405060708ull;
     r.applied_version = 4;
     r.staged_version = 5;
@@ -200,7 +201,8 @@ int main() {
     r.fixed = d.fixed;
     r.positions = d.positions;
     r.ues = {{1, 2}, {3, 1}};
-    r.heard = {{2, 1, -61}, {3, 4, -90}};
+    r.heard = {{2, 1, -61, 25, 100}, {3, 4, -90, 3, 1999}};
+    r.meas = {{1, -55 * 4, 31 * 4, 0}, {3, -83 * 4 - 2, 7 * 4 + 1, 40}};
     const auto w = f1::encode_report(r, k1);
     CHECK(!w.empty() && f1::peek_type(w.data(), w.size()) == f1::Type::Report);
     CHECK(f1::decode_report(w.data(), w.size(), k1) == r);
@@ -218,11 +220,11 @@ int main() {
     f1::Schedule s{7, 9, 1000, 0x1122334455667788ull, {{1, 3}, {3, 1}}};
     const auto ws = f1::encode_schedule(s, k1);
     CHECK(f1::decode_schedule(ws.data(), ws.size(), k1) == s);
-    f1::Ack a{7, 9, f1::AckStatus::Late, 990};
+    f1::Ack a{7, f1::AckKind::Schedule, 9, f1::AckStatus::Late, 990};
     const auto wa = f1::encode_ack(a, k1);
     CHECK(f1::decode_ack(wa.data(), wa.size(), k1) == a);
     auto bad = wa; /* an unknown status byte is refused (unkeyed: tag ignored) */
-    bad[4 + 2 + 4] = 9;
+    bad[4 + 2 + 1 + 4] = 9;
     CHECK(!f1::decode_ack(bad.data(), bad.size(), {}));
     f1::Report big = r;
     big.heard.resize(f1::kMaxHeard + 1);

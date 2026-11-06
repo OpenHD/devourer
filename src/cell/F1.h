@@ -13,7 +13,8 @@
  *            a freshness sequence,
  *            the schedule versions it has applied / staged, its grid (fixed
  *            items + capacity positions, relative to its TBTT), its UEs and
- *            their positions, and the OTHER cells' UEs its radio hears (RSSI).
+ *            their positions and filtered uplink measurements (RSSI/SNR),
+ *            and the OTHER cells' UEs its radio hears (filtered RSSI/SNR).
  *   Schedule CU -> DU: version, the network superframe it takes effect in,
  *            a freshness sequence, and the position of every UE. The CU
  *            resends the current schedule (with a new sequence) as its
@@ -47,6 +48,7 @@
 #define DEVOURER_CELL_F1_H
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -55,18 +57,35 @@
 #include <vector>
 
 #include "cell/Coord.h"
+#include "cell/HoCommand.h"
+#include "cell/Handover.h"
+#include "cell/MeasGap.h"
 #include "cell/Rach.h"
 
 namespace devourer::cell::f1 {
 
-constexpr uint8_t kVersion = 1;
+/* 2 (M6): Report carries the DU's filtered measurements of its own UEs, and
+ * the SNR of the other cells' UEs it hears. 3: every measurement carries its
+ * sample age, so the CU can tell when it expires. */
+/* 5: Uplink (DAPS: a DU forwarding a UE uplink it heard). 4: Handover
+ * messages; Report carries the DU's network-superframe offset
+ * (for the TSF delta, HoCommand.h); Ack names what it acknowledges. */
+/* 7: Neighbours (CU -> DU, the neighbour list for UE measurement gaps,
+ * src/cell/MeasGap.h); Report carries the UEs' own measurements (ue_meas).
+ * 6: Handover carries the target's channel (inter-frequency). */
+/* 8: Phase (CU -> DU: a joining DU's TBTT phase, src/cell/PhasePlan.h); a
+ * Report with phase_us < 0 asks for one. */
+constexpr uint8_t kVersion = 8;
 constexpr size_t kTagLen = 8;
 constexpr size_t kMaxFixed = 8;
 constexpr size_t kMaxPositions = kMaxUesPerCell;
 constexpr size_t kMaxUes = kMaxUesPerCell;
 constexpr size_t kMaxHeard = 64;
+/* Every UE of a full cell with a full MR (serving + kMaxNeighbours). */
+constexpr size_t kMaxUeMeas = kMaxUesPerCell * (kMaxNeighbours + 1); /* 216 < 256 */
 
-enum class Type : uint8_t { Report = 1, Schedule = 2, Ack = 3 };
+enum class Type : uint8_t { Report = 1, Schedule = 2, Ack = 3, Handover = 4, Uplink = 5, Neighbours = 6,
+                            Phase = 7 };
 enum class AckStatus : uint8_t { Staged = 0, Applied = 1, Stale = 2, Late = 3, Invalid = 4 };
 
 inline const char *ack_status_name(AckStatus s) {
@@ -81,8 +100,28 @@ inline const char *ack_status_name(AckStatus s) {
 
 struct HeardUe {
   uint16_t cell = 0, ue = 0;
-  int8_t rssi_dbm = 0;
+  int8_t rssi_dbm = 0; /* filtered (src/cell/Handover.h L3Filter), dBm */
+  int8_t snr_db = 0;   /* filtered, dB */
+  uint16_t age_ms = 0; /* since its newest sample, at report time (saturates) */
   bool operator==(const HeardUe &) const = default;
+};
+/* What a UE measured itself (its MR IE, src/cell/MeasGap.h): `cell`'s
+ * beacons — its serving cell's, and in gaps a neighbour's — relayed by the
+ * serving DU. Quarter dB, with the report's age at the DU. */
+struct UeCellMeas {
+  uint16_t ue = 0, cell = 0;
+  int16_t rssi_qdbm = 0, snr_qdb = 0;
+  uint16_t age_ms = 0;
+  bool operator==(const UeCellMeas &) const = default;
+};
+/* The DU's filtered uplink measurement of one of its own UEs (M6), quarter
+ * dB, so the CU compares serving and neighbour cells on one scale. */
+struct UeMeas {
+  uint16_t ue = 0;
+  int16_t rssi_qdbm = 0;
+  int16_t snr_qdb = 0;
+  uint16_t age_ms = 0; /* since its newest sample, at report time (saturates) */
+  bool operator==(const UeMeas &) const = default;
 };
 
 struct Report {
@@ -94,6 +133,9 @@ struct Report {
   int64_t phase_us = 0;
   int64_t period_us = 0;
   uint64_t net_sf = 0;
+  /* Network superframe - local superframe (valid with net_sf != 0): with
+   * the phase, what fixes this DU's TSF against every other's. */
+  int64_t net_off = 0;
   /* Freshness, as Schedule::seq (the DU's realtime clock, us): the CU
    * accepts a report only above the last one it took from this DU, so a
    * replayed report can neither refresh the DU's state nor move the address
@@ -104,6 +146,8 @@ struct Report {
   std::vector<CoordPosition> positions;
   std::vector<CoordAssign> ues;
   std::vector<HeardUe> heard;
+  std::vector<UeMeas> meas;
+  std::vector<UeCellMeas> ue_meas;
   bool operator==(const Report &) const = default;
 };
 
@@ -119,9 +163,13 @@ struct Schedule {
   bool operator==(const Schedule &) const = default;
 };
 
+/* What an Ack acknowledges. */
+enum class AckKind : uint8_t { Schedule = 0, Handover = 1 };
+
 struct Ack {
   uint16_t du = 0;
-  uint32_t version = 0;
+  AckKind kind = AckKind::Schedule;
+  uint32_t version = 0; /* the schedule version, or the handover id */
   AckStatus status = AckStatus::Staged;
   uint64_t net_sf = 0;
   bool operator==(const Ack &) const = default;
@@ -221,11 +269,36 @@ inline CoordInterval get_iv(Rd &r) {
 }
 } /* namespace detail */
 
+/* A DU's report measurements from its MeasTable snapshot: entries of its own
+ * cell `own` go to `meas` (quarter dB), the others to `heard` (dB), each list
+ * capped at its wire bound. */
+inline void fill_report_measurements(Report &r, uint16_t own, const std::vector<MeasEntry> &snap) {
+  auto clamp8 = [](double v) {
+    return static_cast<int8_t>(std::lround(std::max(-128.0, std::min(127.0, v))));
+  };
+  auto clampq = [](double v) {
+    return static_cast<int16_t>(std::lround(std::max(-32768.0, std::min(32767.0, v * 4.0))));
+  };
+  auto age16 = [](int64_t a) {
+    return static_cast<uint16_t>(std::max<int64_t>(0, std::min<int64_t>(a, 65535)));
+  };
+  r.meas.clear();
+  r.heard.clear();
+  for (const MeasEntry &e : snap) {
+    if (e.cell == own) {
+      if (r.meas.size() < kMaxUes)
+        r.meas.push_back({e.ue, clampq(e.rssi_dbm), clampq(e.snr_db), age16(e.age_ms)});
+    } else if (r.heard.size() < kMaxHeard) {
+      r.heard.push_back({e.cell, e.ue, clamp8(e.rssi_dbm), clamp8(e.snr_db), age16(e.age_ms)});
+    }
+  }
+}
+
 /* Message type of a datagram (before any verification), nullopt if not F1. */
 inline std::optional<Type> peek_type(const uint8_t *p, size_t n) {
   if (p == nullptr || n < 4 + kTagLen || p[0] != 'F' || p[1] != '1' || p[2] != kVersion)
     return std::nullopt;
-  if (p[3] < 1 || p[3] > 3)
+  if (p[3] < 1 || p[3] > 7)
     return std::nullopt;
   return static_cast<Type>(p[3]);
 }
@@ -234,7 +307,8 @@ inline std::optional<Type> peek_type(const uint8_t *p, size_t n) {
 inline std::vector<uint8_t> encode_report(const Report &r, const Mac &mac) {
   using namespace detail;
   if (r.fixed.size() > kMaxFixed || r.positions.size() > kMaxPositions ||
-      r.ues.size() > kMaxUes || r.heard.size() > kMaxHeard)
+      r.ues.size() > kMaxUes || r.heard.size() > kMaxHeard || r.meas.size() > kMaxUes ||
+      r.ue_meas.size() > kMaxUeMeas)
     return {};
   auto m = head(Type::Report);
   put(m, r.du, 2);
@@ -245,6 +319,7 @@ inline std::vector<uint8_t> encode_report(const Report &r, const Mac &mac) {
   put(m, static_cast<uint64_t>(r.phase_us), 8);
   put(m, static_cast<uint64_t>(r.period_us), 8);
   put(m, r.net_sf, 8);
+  put(m, static_cast<uint64_t>(r.net_off), 8);
   put(m, r.seq, 8);
   put(m, r.applied_version, 4);
   put(m, r.staged_version, 4);
@@ -262,6 +337,23 @@ inline std::vector<uint8_t> encode_report(const Report &r, const Mac &mac) {
     put(m, h.cell, 2);
     put(m, h.ue, 2);
     m.push_back(static_cast<uint8_t>(h.rssi_dbm));
+    m.push_back(static_cast<uint8_t>(h.snr_db));
+    put(m, h.age_ms, 2);
+  }
+  m.push_back(static_cast<uint8_t>(r.meas.size()));
+  for (const UeMeas &q : r.meas) {
+    put(m, q.ue, 2);
+    put(m, static_cast<uint16_t>(q.rssi_qdbm), 2);
+    put(m, static_cast<uint16_t>(q.snr_qdb), 2);
+    put(m, q.age_ms, 2);
+  }
+  m.push_back(static_cast<uint8_t>(r.ue_meas.size()));
+  for (const UeCellMeas &q : r.ue_meas) {
+    put(m, q.ue, 2);
+    put(m, q.cell, 2);
+    put(m, static_cast<uint16_t>(q.rssi_qdbm), 2);
+    put(m, static_cast<uint16_t>(q.snr_qdb), 2);
+    put(m, q.age_ms, 2);
   }
   return seal(std::move(m), mac);
 }
@@ -281,6 +373,7 @@ inline std::optional<Report> decode_report(const uint8_t *p, size_t n, const Mac
   x.phase_us = static_cast<int64_t>(r.get(8));
   x.period_us = static_cast<int64_t>(r.get(8));
   x.net_sf = r.get(8);
+  x.net_off = static_cast<int64_t>(r.get(8));
   x.seq = r.get(8);
   x.applied_version = static_cast<uint32_t>(r.get(4));
   x.staged_version = static_cast<uint32_t>(r.get(4));
@@ -308,7 +401,32 @@ inline std::optional<Report> decode_report(const uint8_t *p, size_t n, const Mac
     h.cell = static_cast<uint16_t>(r.get(2));
     h.ue = static_cast<uint16_t>(r.get(2));
     h.rssi_dbm = static_cast<int8_t>(r.get(1));
+    h.snr_db = static_cast<int8_t>(r.get(1));
+    h.age_ms = static_cast<uint16_t>(r.get(2));
     x.heard.push_back(h);
+  }
+  const size_t nm = r.get(1);
+  if (nm > kMaxUes)
+    return std::nullopt;
+  for (size_t i = 0; i < nm && r.ok; ++i) {
+    UeMeas q;
+    q.ue = static_cast<uint16_t>(r.get(2));
+    q.rssi_qdbm = static_cast<int16_t>(static_cast<uint16_t>(r.get(2)));
+    q.snr_qdb = static_cast<int16_t>(static_cast<uint16_t>(r.get(2)));
+    q.age_ms = static_cast<uint16_t>(r.get(2));
+    x.meas.push_back(q);
+  }
+  const size_t nu = r.get(1);
+  if (nu > kMaxUeMeas)
+    return std::nullopt;
+  for (size_t i = 0; i < nu && r.ok; ++i) {
+    UeCellMeas q;
+    q.ue = static_cast<uint16_t>(r.get(2));
+    q.cell = static_cast<uint16_t>(r.get(2));
+    q.rssi_qdbm = static_cast<int16_t>(static_cast<uint16_t>(r.get(2)));
+    q.snr_qdb = static_cast<int16_t>(static_cast<uint16_t>(r.get(2)));
+    q.age_ms = static_cast<uint16_t>(r.get(2));
+    x.ue_meas.push_back(q);
   }
   if (!r.ok || r.i != r.n)
     return std::nullopt;
@@ -348,6 +466,7 @@ inline std::vector<uint8_t> encode_ack(const Ack &a, const Mac &mac) {
   using namespace detail;
   auto m = head(Type::Ack);
   put(m, a.du, 2);
+  m.push_back(static_cast<uint8_t>(a.kind));
   put(m, a.version, 4);
   m.push_back(static_cast<uint8_t>(a.status));
   put(m, a.net_sf, 8);
@@ -362,12 +481,189 @@ inline std::optional<Ack> decode_ack(const uint8_t *p, size_t n, const Mac &mac)
   Rd &r = *o;
   Ack a;
   a.du = static_cast<uint16_t>(r.get(2));
+  const uint8_t kind = static_cast<uint8_t>(r.get(1));
+  if (kind > static_cast<uint8_t>(AckKind::Handover))
+    return std::nullopt;
+  a.kind = static_cast<AckKind>(kind);
   a.version = static_cast<uint32_t>(r.get(4));
   const uint8_t st = static_cast<uint8_t>(r.get(1));
   a.net_sf = r.get(8);
   if (!r.ok || r.i != r.n || st > static_cast<uint8_t>(AckStatus::Invalid))
     return std::nullopt;
   a.status = static_cast<AckStatus>(st);
+  return a;
+}
+
+/* The handover command (HoCommand.h), CU -> both DUs; `du` addresses the
+ * DU this copy is for. */
+inline std::vector<uint8_t> encode_handover(uint16_t du, const HoCommand &h, const Mac &mac) {
+  using namespace detail;
+  auto m = head(Type::Handover);
+  put(m, du, 2);
+  put(m, h.id, 4);
+  put(m, h.ue, 2);
+  put(m, h.source, 2);
+  put(m, h.target, 2);
+  put(m, h.target_ue, 2);
+  m.push_back(h.target_channel);
+  m.push_back(h.target_pos);
+  put(m, h.effective_net_sf, 8);
+  put(m, static_cast<uint64_t>(h.tsf_delta_us), 8);
+  put(m, h.seq, 8);
+  return seal(std::move(m), mac);
+}
+
+/* {addressed DU, command}; nullopt for another type or a bad tag. */
+inline std::optional<std::pair<uint16_t, HoCommand>> decode_handover(const uint8_t *p, size_t n,
+                                                                     const Mac &mac) {
+  using namespace detail;
+  auto o = open(p, n, Type::Handover, mac);
+  if (!o)
+    return std::nullopt;
+  Rd &r = *o;
+  const uint16_t du = static_cast<uint16_t>(r.get(2));
+  HoCommand h;
+  h.id = static_cast<uint32_t>(r.get(4));
+  h.ue = static_cast<uint16_t>(r.get(2));
+  h.source = static_cast<uint16_t>(r.get(2));
+  h.target = static_cast<uint16_t>(r.get(2));
+  h.target_ue = static_cast<uint16_t>(r.get(2));
+  h.target_channel = static_cast<uint8_t>(r.get(1));
+  h.target_pos = static_cast<uint8_t>(r.get(1));
+  h.effective_net_sf = r.get(8);
+  h.tsf_delta_us = static_cast<int64_t>(r.get(8));
+  h.seq = r.get(8);
+  if (!r.ok || r.i != r.n)
+    return std::nullopt;
+  return std::make_pair(du, h);
+}
+
+/* DAPS (M6): one UE uplink a DU heard, forwarded to the CU. `cell`/`ue`
+ * are the identity it was heard under (the UE beacon's SA); `seq` its
+ * common sequence (Handover.h ul_seq_from_egress). */
+struct UplinkFwd {
+  uint16_t du = 0;
+  uint16_t cell = 0, ue = 0;
+  uint32_t seq = 0;
+  int8_t rssi_dbm = 0;
+  bool operator==(const UplinkFwd &) const = default;
+};
+
+inline std::vector<uint8_t> encode_uplink(const UplinkFwd &u, const Mac &mac) {
+  using namespace detail;
+  auto m = head(Type::Uplink);
+  put(m, u.du, 2);
+  put(m, u.cell, 2);
+  put(m, u.ue, 2);
+  put(m, u.seq, 4);
+  m.push_back(static_cast<uint8_t>(u.rssi_dbm));
+  return seal(std::move(m), mac);
+}
+
+inline std::optional<UplinkFwd> decode_uplink(const uint8_t *p, size_t n, const Mac &mac) {
+  using namespace detail;
+  auto o = open(p, n, Type::Uplink, mac);
+  if (!o)
+    return std::nullopt;
+  Rd &r = *o;
+  UplinkFwd u;
+  u.du = static_cast<uint16_t>(r.get(2));
+  u.cell = static_cast<uint16_t>(r.get(2));
+  u.ue = static_cast<uint16_t>(r.get(2));
+  u.seq = static_cast<uint32_t>(r.get(4));
+  u.rssi_dbm = static_cast<int8_t>(r.get(1));
+  if (!r.ok || r.i != r.n)
+    return std::nullopt;
+  return u;
+}
+
+/* CU -> DU: the cells a DU's UEs should measure (their channel and TBTT
+ * phase); the DU airs them as offsets on its own grid (MeasGap.h NL IE).
+ * Resent each round; `seq` is freshness (as Schedule::seq). */
+struct NeighbourEntry {
+  uint16_t cell = 0;
+  uint8_t channel = 0;
+  int64_t phase_us = 0;
+  bool operator==(const NeighbourEntry &) const = default;
+};
+struct Neighbours {
+  uint16_t du = 0;
+  uint64_t seq = 0;
+  std::vector<NeighbourEntry> cells;
+  bool operator==(const Neighbours &) const = default;
+};
+
+inline std::vector<uint8_t> encode_neighbours(const Neighbours &n, const Mac &mac) {
+  using namespace detail;
+  if (n.cells.size() > kMaxNeighbours)
+    return {};
+  auto m = head(Type::Neighbours);
+  put(m, n.du, 2);
+  put(m, n.seq, 8);
+  m.push_back(static_cast<uint8_t>(n.cells.size()));
+  for (const NeighbourEntry &c : n.cells) {
+    put(m, c.cell, 2);
+    m.push_back(c.channel);
+    put(m, static_cast<uint64_t>(c.phase_us), 8);
+  }
+  return seal(std::move(m), mac);
+}
+
+inline std::optional<Neighbours> decode_neighbours(const uint8_t *p, size_t n, const Mac &mac) {
+  using namespace detail;
+  auto o = open(p, n, Type::Neighbours, mac);
+  if (!o)
+    return std::nullopt;
+  Rd &r = *o;
+  Neighbours x;
+  x.du = static_cast<uint16_t>(r.get(2));
+  x.seq = r.get(8);
+  const size_t cnt = r.get(1);
+  if (cnt > kMaxNeighbours)
+    return std::nullopt;
+  for (size_t i = 0; i < cnt && r.ok; ++i) {
+    NeighbourEntry c;
+    c.cell = static_cast<uint16_t>(r.get(2));
+    c.channel = static_cast<uint8_t>(r.get(1));
+    c.phase_us = static_cast<int64_t>(r.get(8));
+    x.cells.push_back(c);
+  }
+  if (!r.ok || r.i != r.n)
+    return std::nullopt;
+  return x;
+}
+
+/* CU -> DU: the phase a joining DU is to hold its grid at (the answer to a
+ * Report with phase_us < 0); `seq` echoes that Report's, so the DU takes
+ * only an answer to its own run's requests. */
+struct PhaseAssign {
+  uint16_t du = 0;
+  int64_t phase_us = 0;
+  uint64_t seq = 0;
+  bool operator==(const PhaseAssign &) const = default;
+};
+
+inline std::vector<uint8_t> encode_phase(const PhaseAssign &a, const Mac &mac) {
+  using namespace detail;
+  auto m = head(Type::Phase);
+  put(m, a.du, 2);
+  put(m, static_cast<uint64_t>(a.phase_us), 8);
+  put(m, a.seq, 8);
+  return seal(std::move(m), mac);
+}
+
+inline std::optional<PhaseAssign> decode_phase(const uint8_t *p, size_t n, const Mac &mac) {
+  using namespace detail;
+  auto o = open(p, n, Type::Phase, mac);
+  if (!o)
+    return std::nullopt;
+  Rd &r = *o;
+  PhaseAssign a;
+  a.du = static_cast<uint16_t>(r.get(2));
+  a.phase_us = static_cast<int64_t>(r.get(8));
+  a.seq = r.get(8);
+  if (!r.ok || r.i != r.n)
+    return std::nullopt;
   return a;
 }
 

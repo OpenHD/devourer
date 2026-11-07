@@ -37,7 +37,8 @@ public:
                bool rx_zerocopy = true, RxMode rx_mode = RxMode::Async,
                int pool_spare = 0, int ring_ms = 0,
                PoolExhaust pool_exhaust = PoolExhaust::Backpressure,
-               bool tx_no_cancel_multipkt = false);
+               bool tx_no_cancel_multipkt = false,
+               bool register_batching = true);
   ~UsbTransport() override;
 
   bool is_usb() const override { return true; }
@@ -209,6 +210,7 @@ private:
    * issued; per instance, so two adapters in one process do not
    * cross-attribute their InitTimer stage counts. */
   std::atomic<uint64_t> _ctrl_xfers{0};
+  bool _register_batching = true;
   bool _tx_no_cancel_multipkt = false; /* DeviceConfig::Tx; tx_sync_data only */
   /* Smallest bulk-OUT wMaxPacketSize, from discover_endpoints: what
    * tx_sync_data's never-cancel rule measures a transfer against

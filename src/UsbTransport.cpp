@@ -316,8 +316,9 @@ UsbTransport::UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
                            std::shared_ptr<devourer::UsbDeviceLock> usb_lock,
                            bool rx_zerocopy, RxMode rx_mode, int pool_spare,
                            int ring_ms, PoolExhaust pool_exhaust,
-                           bool tx_no_cancel_multipkt)
-    : _tx_no_cancel_multipkt{tx_no_cancel_multipkt}, _dev_handle{dev_handle},
+                           bool tx_no_cancel_multipkt, bool register_batching)
+    : _register_batching{register_batching},
+      _tx_no_cancel_multipkt{tx_no_cancel_multipkt}, _dev_handle{dev_handle},
       _ctx{ctx}, _logger{std::move(logger)},
       _rx_zerocopy{rx_zerocopy}, _rx_mode{rx_mode}, _pool_spare{pool_spare},
       _ring_ms{ring_ms}, _pool_exhaust{pool_exhaust},
@@ -420,7 +421,8 @@ void UsbTransport::write_batch_begin() {
   _aw->generation++;
   /* A session that already failed to reap its transfers has a short pool and
    * a suspect event loop; stay synchronous rather than pipeline into it. */
-  if (_aw_abandoned)
+  // Host policy can disable pipelining without disabling the batch verdict.
+  if (_aw_abandoned || !_register_batching)
     return;
   if (_aw_all.empty()) {
     /* Built transactionally: a slot whose transfer allocation failed must

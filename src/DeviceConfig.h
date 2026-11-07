@@ -1,5 +1,7 @@
 #pragma once
 
+#define DEVOURER_HAS_USB_REGISTER_BATCHING 1
+
 /* DeviceConfig — construction-time configuration, passed to
  * WiFiDriver::CreateRadio (defaulted: CreateRadio(handle) gives stock
  * behaviour). Fields are fixed for the device's lifetime; knobs that change
@@ -607,6 +609,9 @@ struct DeviceConfig {
      * historical copy-on-reap path) when unsupported, so leaving it on is safe.
      * 1 = on (default), 0 = force the heap path. */
     bool rx_zerocopy = true;
+    // Hosts such as RV1106 require ordered synchronous register transfers.
+    // Disabling pipelining keeps batch write-error accounting enabled.
+    bool register_batching = true;
   } usb;
 
   /* ---- PCIe (DEVOURER_PCIE builds; see src/PcieTransport.h) ------------ */

@@ -411,13 +411,12 @@ heard in the new grid.
   instance, as on a handover switch. That is the DL HARQ sequence space, the
   MR generation (the DU checks it against its own new count), the neighbour
   list and gap parking, and any handover IE the old instance aired.
-- **The exposure:** grant maps carry no tag (they never did), so the epoch
-  rule orders maps; it does not authenticate them. A forged map could
-  already redirect a UE's slots. The restart path widens that: within the
-  re-attach window after a clock step, a forged lower-epoch map due near the
-  beacon's count also resets the UE's per-DU state (HARQ, MR generation,
-  neighbours, pending handover IEs). Grant-map authentication is open
-  (below).
+- **Authentication:** grant maps carry the cell key's tag (v2,
+  `src/cell/GrantMap.h`), so with `CELL_PSK` a forged map is refused before
+  either rule sees it. It can neither move a UE's slots nor, through the
+  restart path, reset its per-DU state. What remains is a replayed genuine
+  map. A pre-restart one is due far from the new count and refused; one
+  from the new instance is that DU's own.
 
 **Rig result** (testrig `scripts/m6_fitstep.sh`, restart case, 3 runs, all
 pass).
@@ -446,6 +445,230 @@ pass).
   the slot matching its id, not the slot of its grant. A CU move to another
   position showed as DL out of slot (0.05 in slot); the frames themselves
   were right. It now uses the grant in force.
+
+## Re-joining through the RACH after a DU restart
+
+Re-attachment (above) brings back a static UE: the restarted DU grants its
+id again. A UE that joined through the RACH holds an id the new DU instance
+does not know, so after re-attaching it is in no map.
+
+- **The rule:** a joined UE that the authentic map in force has not granted
+  for `CELL_UE_REJOIN_SF` (30) superframes drops its id and joins again
+  (`cell.ue.rejoin`). That covers a DU that restarted and one that released
+  it. The rule is skipped mid-handover; static UEs never re-join.
+- **What the re-join resets:** its uplink beacon goes off and its ACK
+  responder is cleared. The DL HARQ space of the old id goes. The RACH
+  client is new, with a **fresh nonce**: a DU answers a repeated (MAC,
+  nonce) request from its cache, which would be the old id.
+- **The stable joiner MAC** (`CELL_JOINER_MAC`, or derived from host and
+  radio) is kept. A DU that still holds the UE's registry entry gives the
+  same position back.
+
+**A driver bug it found.** The first re-joins never got an answer. Every
+msgA arrived at the same phase (~29.9 ms, drifting with the UE's own
+crystal), past the RACH slot, whatever offset the UE drew.
+- **Not the cause:** the UE's timing checks passed.
+- **The A/B:** with its uplink beacon left running, the msgA landed in slot.
+- **The cause:** Kestrel's `StopBeacon` cleared the beacon-TX enable but
+  left the TBTT protection `StartBeacon` turns on (`TBTT_PROHIB_EN`,
+  `BRK_SETUP`). The port went on holding injected frames to its old beacon
+  grid. `StopBeacon` now clears both.
+- **Not established:** that 400 × 32 µs of `BCN_HOLD` after the UE's TBTT
+  is exactly the ~13 ms observed.
+
+**Rig result** (testrig `scripts/m6_rejoin.sh`).
+- **The case:** UE1 joins cell 1 through the RACH (`CELL_UE=0`, an 8 ms RACH
+  slot), and DU1 is killed and restarted under it 35 s in. Keyed, as all
+  runs now are. 3 runs, all pass.
+
+| KPI (3 runs) | value |
+|---|---|
+| re-attach, then one re-join | every run |
+| second join, after the restarted DU's service start | −4 to +28 sf (median 11) |
+| its RACH attempts | 4–8 (the first fall in the restarted DU's acquisition, its grid still moving) |
+| uplink of the new id at the restarted DU, from 10 sf after the join | heard 100 %, in slot 100 % |
+
+- **With `CELL_UE_REJOIN_SF=0`** (the counterfactual, 1 run), the UE keeps a
+  dead id and the restarted DU never hears it.
+- **Regression for the `StopBeacon` change,** all passing:
+  - inter-frequency handover 2, plus fallback 1 (each a beacon stop and
+    restart);
+  - measurement-gap handover 2;
+  - clock-fit restart and transient 1 + 1;
+  - same-channel handover 1.
+
+## Per-cell keys and the handover context (802.11r-style)
+
+Before this, every cell, DU and UE shared one key (`CELL_PSK`), so whoever
+held it could forge any cell. Now each key comes from one master that only
+the CU and provisioning hold (`src/cell/Keys.h` gives the derivation and who
+holds what):
+- **The cell key** `K_c` tags everything that controls cell c's UEs: the
+  grant map, the handover IE, the DL body, the UE beacon's own tag, the MR
+  and the RACH. A compromised DU or UE of one cell can forge that cell only.
+- **The area key** `K_A` tags what *another* cell must check: the
+  neighbour list (the provenance of a measured neighbour beacon) and a
+  second, area tag on every UE beacon (v3). A neighbour DU checks that tag
+  before it counts a UE as heard or forwards it for DAPS; before, it took
+  "heard" from any frame with the right address.
+- **The UE key** `K_(c,u)` belongs to the UE's home identity.
+
+**The handover context.** The UE needs the target's key before the switch,
+to take the target's grant maps.
+- **The CU** (`RAN_MASTER_KEY`) wraps `K_t` for that UE alone, under its UE
+  key: a per-handover pad plus a 4-byte key check (`wrap_context`). The
+  context is carried in the F1 handover command (v9).
+- **The source DU** relays the 24 opaque bytes in its handover IE (v3).
+  Neither DU can read them, and nor can the other UEs of the source cell:
+  they share `K_s`, not that UE's key.
+- **The UE** unwraps them when it accepts the command. It refuses a context
+  that is not its own (`cell.ue.ho_no_context`): the key check fails for
+  another UE's key, another handover or a tampered context. It verifies the
+  target's buffered maps with `K_t`, switches to it at the switch, and goes
+  back to `K_s` on a fallback.
+- **The CU follows a UE's home** across handovers (`home_of`), so a second
+  handover still wraps for the UE's own key.
+
+Without `CELL_AREA_KEY` all of this collapses to the one shared key, as
+before.
+
+**Rig result** (testrig `scripts/m6_cellkeys.sh`, the testrig scripts
+deriving every role's keys from one master; all pass).
+
+| case | runs | result |
+|---|---|---|
+| handover under per-cell keys | 2 | context in every command (home 1:1); switch, target in slot 99.8 %, `ran.ho_done`; 0 maps refused |
+| a UE holding cell 2's key in cell 1 (a cell-2 insider forging cell 1) | 2 | 0 of 879 maps taken, never heard in slot; cell 2 unaffected |
+| a UE holding another UE's key | 2 | all 7 commands refused (no context), no switch, DU1 kept it (heard 100 %, in slot 99.8 %) |
+| coordination, "heard" from area-tagged UE beacons | 1 | `ran_coord_analyze` pass; both cells' UEs heard by the other DU |
+
+**The M6 suite under per-cell keys** (`M5_MASTER`, 1 run of each; all pass):
+- inter-frequency handover and fallback;
+- DAPS;
+- measurement-gap handover (the neighbour beacon's provenance now from the
+  area key);
+- phase planning;
+- the crossing and its source failure;
+- clock fit across a DU restart, and the re-join after one.
+
+One shared-key handover also passes, so the old mode is unchanged.
+
+The first restart runs failed, but in the rig script: the restarted DU was
+started without its keys, and the keyed UE rightly refused its 546
+unauthenticated maps. The script fix was to start it with them.
+
+## An emulated crossing (nothing forced)
+
+Every earlier handover here had its trigger forced or was a standing
+difference between two cells. Here the UE crosses. Both cells are on one
+channel, with one UE (UE1, starting in cell 1).
+- **The emulation** (`CELL_DU_TX_RAMP`): the DUs ramp their TX power
+  against each other, piecewise linear on one wall-clock zero
+  (`CELL_DU_TX_RAMP_T0`; the DU hosts are NTP-synced). Beacons and DL alike
+  follow it.
+- **What the UE sees:** it measures both beacons (no gaps on one channel)
+  and reports them (`cell.ue.mr`).
+- **Who decides:** the CU's A3 at its defaults (offset 3 dB, hysteresis
+  1 dB, time-to-trigger 640 ms, dwell 2 s).
+
+**The ramps** (testrig `scripts/m6_crossing.sh`): cell 1 fades by 16 dB over
+15 s while cell 2 rises by as much. They hold, then reverse.
+- **The UE's measured margin** (the other cell against the serving one)
+  sweeps from about −13 to +24 dB and back.
+- **The rig's power-to-RSSI curve** is not linear: −8 dB of offset reads
+  about −9 dB at the UE, and −9 dB about −12 dB. Its cause is not
+  established; the tests use the measured margins, not the offsets.
+
+**Crossing, there and back** (3 runs, all pass: exactly 1 → 2 then 2 → 1 in
+each).
+
+| KPI (6 handovers) | min | median | max |
+|---|---|---|---|
+| UE margin reaching the A3 entry (4 dB) → switch | 40 sf | 48 sf | 55 sf |
+| margin at the CU's trigger | 9 dB | 11 dB | 15 dB |
+| interruption (first in-slot uplink at the target) | 1 sf | 1 sf | 2 sf |
+| uplinks missing at the CU over the run (DAPS) | 0 | 0 | 1 |
+
+- **Where the time goes:** 24 sf of the crossing-to-switch is the
+  handover lead (`RAN_HO_LEAD_SF`). The rest is the time-to-trigger plus the
+  1 s reporting chain: the UE's MR (`CELL_UE_MR_MS`), the DU's F1 report
+  (`CELL_F1_REPORT_MS`) and the CU's A3 round (`RAN_PLAN_MS`).
+- **Why the trigger overshoots:** at ~2 dB/s of margin, the margin keeps
+  moving during that chain, so the trigger lands 5–11 dB past the entry.
+- **Each switch** keeps TSF continuity and is heard in slot at the target
+  (≥ 99 %), and the source releases the UE.
+
+**Hover** (3 runs, all pass). The ramps stop with the margin held just under
+the entry: median +3 dB, p10–p90 +2 to +4 dB. 13–15 % of the UE's reports
+were at or above the entry.
+- **Criterion and result:** at most one handover and never a switch back
+  (0 handovers in all 3 runs). The time-to-trigger and the filtering never
+  let a noise excursion through.
+- **Why the criterion allows one:** one handover at a hover is correct A3
+  behaviour, not a failure: at +3 dB the filtered margin may hold the 4 dB
+  entry for the time-to-trigger. One hover run of an earlier set (the CU fix below does
+  not touch the A3) did exactly that, once, and did not switch back. What
+  the test must catch is the ping-pong: a switch back.
+
+**The source failing mid-crossing** (2 + 2 runs). DU1 is killed the moment
+its UE accepts the handover, with the switch still the 24 sf lead away.
+- **The window:** uplinks missing from the CU's stream, from 24 sf before
+  the switch to 20 after (the uplink seq is the network superframe).
+- **With DAPS:** 0 and 0 missing (asserted ≤ 1). The target delivers the
+  UE's uplinks until the switch, and the switch happens.
+- **Without DAPS:** 11 and 13 missing (reported). The source's path dies
+  with the DU.
+- **Outside the window,** with one cell left, 4–5 isolated single losses
+  over the rest of the run are that path's own (~0.4 %).
+
+**A CU bug the crossing found.** At first the target heard the UE in slot
+only 91–98 % after a switch.
+- **The symptom:** the CU re-issued the target's two UE positions in turn,
+  every plan round. Each swap cost the moving UE one uplink in its old slot.
+- **The cause:** the CU planned from the DUs' *reported* positions. A
+  schedule takes effect `RAN_LEAD_SF` (12 sf) ahead, more than the plan
+  round, so the report still showed the positions before the last
+  schedule. With two equally good layouts, the planner "kept" the stale one
+  and reversed itself each round.
+- **Why M5 never saw it:** a move only ever went to a strictly better
+  position there. Here a handover arrival made two layouts equal.
+- **The fix:** the CU plans each UE from its own issued schedule, and from
+  the report only for a UE the schedule does not name yet (a handover
+  arrival). After it, 8 schedules in a whole run, and every switch in slot.
+
+## Grant-map authentication, and the suite keyed
+
+The grant map IE (v2, `src/cell/GrantMap.h`) carries the cell key's tag
+after its CRC, as the NL, MR and handover IEs do.
+- **With `CELL_PSK`:** a UE takes only authentic maps. A forged map neither
+  moves its slots nor, through the restart path, resets its grant state.
+- **Without a key:** an unauthenticated development cell, or a passive
+  witness, checks the structure only.
+- **v1 maps** (untagged) are refused.
+- **Counters:** the UE counts serving maps taken and refused (`gm_ok`,
+  `gm_refused` in `cell.ue.done`; the first refusal logs
+  `cell.ue.gm_refused`).
+
+**On air** (testrig `scripts/m6_gmauth.sh`, 2 runs, pass). Every role holds
+the cell key except UE2, which holds another. To UE2 each genuine map is a
+map under the wrong key, as a forged one is to a keyed UE.
+
+| | maps taken | maps refused | heard in slot by its DU |
+|---|---|---|---|
+| UE1 (cell key) | 586–587 | 0 | 99.8 % |
+| UE2 (another key) | 0 | 586–587 | never |
+
+**The M6 suite re-run keyed** (all roles on one `CELL_PSK`; all pass). No
+keyed UE refused a map, apart from UE2 above.
+
+| test | runs | result |
+|---|---|---|
+| same-channel handover + fallback | 2 + 1 | interruption 1 sf; fallback 10 sf |
+| inter-frequency handover | 2 | interruption 2–3 sf, retune 23.6 ms |
+| DAPS (source killed mid-crossing) | 2 + 2 | missing uplinks 0 / 0, against 11 / 16 without |
+| measurement-gap handover | 2 | deaf 54.1 ms, A3 fired at defaults |
+| phase planning | 2 | DU2 at 51200, both UEs 57 gaps heard |
+| clock-fit jump + DU restart | 1 + 1 | restart followed and re-attached; transient ignored |
 
 ## DAPS: the duplicated uplink (same channel)
 
@@ -541,25 +764,26 @@ superframe when there is nothing to serve.
   - downlink duplication;
   - the different-channel (sequential) variant, with its retune and deaf-time
     budget.
-- **A moving UE:** the rig's UEs are stationary, so the crossing is forced
-  with a negative A3 offset.
 - **Phase planning beyond two cells:** a joining cell is placed against the
   running ones, which never move. With three or more cells on different
   channels, the 26 ms retune leaves no layout where every pair can measure
   both ways. Re-phasing live cells, or longer superframes, is open.
-- **Grant-map authentication:** the grant map IE has no tag, unlike the
-  NL, MR and handover IEs. A tag keyed per cell (as `CELL_PSK`), checked
-  before any `offer`, would close the forged-map exposure, including the
-  restart path. It is a wire change for the DU, UE and witness.
-- **A DU restart under RACH-joined UEs:** re-attachment (above) is for the
-  rig's static UEs, whose id the restarted DU grants again. A UE that joined
-  through the RACH holds an id the new DU instance does not know; re-joining
-  it is open.
-- **No crossing test:** every handover result here is from stationary UEs.
-  The trigger is either forced or the measured standing difference between
-  two cells. No A→B path-loss ramp has been run, so none of these numbers
-  validates a crossing. An emulated crossing (the source DU ramping its TX
-  power, which its beacons follow) is the way to get one.
-- **Security context:** the cells share one key on the rig (`CELL_PSK`).
-  Pre-staging a per-cell context (802.11r-style) is open.
+- **A real moving UE:** the crossing below is emulated by the DUs' TX
+  power. The uplink path loss stays the same, there is one UE, and the ramp
+  rate is one setting (~2 dB/s of margin). No over-the-air motion,
+  fading or crowd has been run.
+- **Per-cell context for joined UEs:** a RACH-joined UE has no provisioned
+  UE key, so the CU cannot wrap a context for it. Under per-cell keys it
+  refuses every handover command (`cell.ue.ho_no_context`) and stays in its
+  cell. Provisioning a key at the join, from the RACH exchange, is open.
+- **Area-key exposure:** anyone holding the area key can forge the
+  neighbour list and a UE beacon's area tag. That can fake measurement
+  provenance and "heard" or DAPS presence, but never a cell's control.
+  Per-UE area credentials are open.
+- **Keyed rig runs only from the grant-map authentication on:** the
+  handover, DAPS, inter-frequency, measurement-gap, phase-planning and
+  clock-fit rig results above were run without `CELL_PSK`, an
+  unauthenticated development cell. Their tags were zeros and were not
+  checked; F1 was keyed throughout. The testrig scripts now give every cell
+  role one key. The suite re-run keyed is in the next section.
 - **EVM:** not in the measurement reports.

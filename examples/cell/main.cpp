@@ -56,6 +56,17 @@
 //   CELL_PSK                  the cell key (HMAC-SHA1, 8-byte tags): the HARQ
 //                             feedback IE, the DL body and the RACH; unset = an
 //                             unauthenticated development cell (no RACH).
+//                             With per-cell keys: THIS cell's key (K_c,
+//                             src/cell/Keys.h; a UE: its serving cell's).
+//   CELL_AREA_KEY             per-cell keys (Keys.h): the area key K_A, which
+//                             tags what another cell checks (the neighbour
+//                             list, the UE beacon's area tag). Unset = one
+//                             shared key (CELL_PSK) for everything.
+//   CELL_UE_KEY               UE, per-cell keys: its own key K_(c,u) (home
+//                             cell and id), which unwraps the target cell's
+//                             key a handover carries. Without it, or for a
+//                             context that is not its own, the UE refuses the
+//                             handover (cell.ue.ho_no_context).
 //   CELL_UE=0 (role ue)       a JOINING UE: it gets its id through the RACH
 //   CELL_JOINER_MAC           the joiner's MAC (default: derived from the host
 //                             name + DEVOURER_PCIE_BDF, so a restart re-joins
@@ -130,11 +141,22 @@
 //                             beacons outlast the DU's discipline pass
 //                             (CELL_SYNC_LOOP_MS 500): a jump the DU undoes
 //                             itself is never followed, only a lasting one.
+//   CELL_UE_REJOIN_SF [30]    UE that joined through the RACH: not granted by
+//                             the map in force this many superframes (its DU
+//                             restarted or released it) = drop the id and
+//                             join again, with a fresh nonce (cell.ue.rejoin).
+//                             0 = never. Static UEs never re-join.
 //   CELL_UE_REATTACH_SF [200] UE: for this long after a confirmed step of the
 //                             DU's clock, a grant map at a LOWER epoch that is
 //                             due near its beacon's superframe means the DU
 //                             restarted: the grant state starts over
 //                             (cell.ue.reattach). 0 = never.
+//   CELL_DU_TX_RAMP           DU, test: T:DB,T:DB,... the TX power offset
+//                             (dB against the calibrated base; beacons and DL)
+//                             piecewise linear in seconds from
+//                             CELL_DU_TX_RAMP_T0 (unix s) or the service
+//                             start, held at the ends (cell.du.txpwr): an
+//                             emulated crossing.
 //   CELL_DU_TEST_TSF_STEP     DU, test only: US@SF — add US to the TSF once at
 //                             local superframe SF, behind the discipline's back
 //                             (cell.test.tsf_step); the discipline undoes it.
@@ -182,6 +204,7 @@
 #include "radio_open.h"
 #include "cell/Coord.h"
 #include "cell/F1.h"
+#include "cell/Keys.h"
 #include "cell/Rach.h"
 #include "cell/SyncHealth.h"
 #include "cell/TsfDiscipline.h"
@@ -344,9 +367,23 @@ CellMac hmac_sha1(const std::string &key) {
 #endif
 }
 CellMac cell_auth(const Cfg &c) { return hmac_sha1(c.psk); }
+/* The area key (src/cell/Keys.h): what another cell must be able to check —
+ * the neighbour list and the UE beacon's area tag. CELL_AREA_KEY, else the
+ * cell key (one shared key, as before). */
+CellMac area_auth(const Cfg &c) {
+  const char *a = std::getenv("CELL_AREA_KEY");
+  return a && *a ? hmac_sha1(a) : cell_auth(c);
+}
 devourer::cell::Mac rach_mac(const Cfg &c) { return cell_auth(c); }
 bool auth_ok(const Cfg &c) {
 #if !defined(DEVOURER_CELL_OPENSSL)
+  /* Without OpenSSL a key would become an EMPTY authenticator — silently
+   * unauthenticated: refused, for every key. */
+  for (const char *k : {"CELL_AREA_KEY", "CELL_UE_KEY"})
+    if (const char *v = std::getenv(k); v && *v) {
+      fprintf(stderr, "%s needs a build with OpenSSL\n", k);
+      return false;
+    }
   if (!c.psk.empty()) {
     fprintf(stderr, "CELL_PSK needs a build with OpenSSL\n");
     return false;
@@ -451,7 +488,7 @@ bool du_budget_ok(const Cfg &c, const std::vector<uint16_t> &ues) {
       rar[1] = 'B';
       rar[2] = static_cast<uint8_t>(devourer::cell::kRachMaxPerBeacon);
     }
-    const int64_t bcn_need = 22 + ofdm_airtime_us(build_du_beacon(probe, rar).size() + 4, 6);
+    const int64_t bcn_need = 22 + ofdm_airtime_us(build_du_beacon(probe, cell_auth(c), rar).size() + 4, 6);
     SlotBudget dl;
     dl.mpdu_len = build_dl_frame(c.cell, 1, 0, 0, pad).size() + 4;
     dl.acked = true;
@@ -501,6 +538,7 @@ int run_du(IRadio *dev, const Cfg &c) {
     return 2;
   }
   const CellMac auth = cell_auth(c);
+  const CellMac area = area_auth(c);
   const int64_t release_sf = envl("CELL_RELEASE_SF", 50, 2, 100000);
 
   /* M4 DU service mode (see the header): the PHC, the discipline loop, the
@@ -773,7 +811,46 @@ int run_du(IRadio *dev, const Cfg &c) {
     }
     emit(l);
   }
-  auto bcn = build_du_beacon(map);
+  /* CELL_DU_TX_RAMP=T:DB,T:DB,...: TX power offset (dB, against the
+   * calibrated base) piecewise linear in seconds since the DU starts serving;
+   * held at the ends. Test only (an emulated crossing). */
+  std::vector<std::pair<double, double>> tx_ramp;
+  if (const char *rp = std::getenv("CELL_DU_TX_RAMP"); rp && *rp) {
+    std::string t = rp;
+    for (size_t p0 = 0; p0 < t.size();) {
+      const size_t q = t.find(',', p0);
+      const std::string item = t.substr(p0, q == std::string::npos ? std::string::npos : q - p0);
+      double ts = 0, db = 0;
+      if (std::sscanf(item.c_str(), "%lf:%lf", &ts, &db) != 2 || ts < 0 || db < -40 || db > 20 ||
+          (!tx_ramp.empty() && ts <= tx_ramp.back().first)) {
+        fprintf(stderr, "CELL_DU_TX_RAMP: T:DB,... with T increasing, -40 <= DB <= 20\n");
+        return 2;
+      }
+      tx_ramp.push_back({ts, db});
+      if (q == std::string::npos)
+        break;
+      p0 = q + 1;
+    }
+  }
+  /* The ramp's zero: CELL_DU_TX_RAMP_T0 (unix seconds: the DUs of one test
+   * ramp together, on their hosts' synced clocks), else service start. */
+  double ramp_t0_unix = 0;
+  if (const char *z = std::getenv("CELL_DU_TX_RAMP_T0"); z && *z) {
+    char *end = nullptr;
+    ramp_t0_unix = std::strtod(z, &end);
+    if (end == z || *end != '\0' || !(ramp_t0_unix > 0)) {
+      fprintf(stderr, "CELL_DU_TX_RAMP_T0: unix seconds (> 0), got \"%s\"\n", z);
+      return 2;
+    }
+  }
+  if (!tx_ramp.empty() && !dev->GetTxPowerCaps().supported) {
+    fprintf(stderr, "CELL_DU_TX_RAMP: this radio has no runtime TX power control\n");
+    return 2;
+  }
+  bool ramp_short_warned = false;
+  std::chrono::steady_clock::time_point ramp_t0{};
+  int ramp_set_qdb = INT_MIN;
+  auto bcn = build_du_beacon(map, auth);
   if (bcn.empty() || !dev->StartBeacon(bcn.data(), bcn.size(), c.tu)) {
     fprintf(stderr, "StartBeacon failed\n");
     return 1;
@@ -1139,6 +1216,11 @@ int run_du(IRadio *dev, const Cfg &c) {
         const uint16_t oc = static_cast<uint16_t>(p.Data[13] << 8 | p.Data[14]);
         const uint16_t ou = p.Data[15];
         if (oc != c.cell && ou >= 1) {
+          /* Only an authentic one counts (its AREA tag: this DU does not hold
+           * the other cell's key) — as heard, and for DAPS forwarding of a
+           * handing-over UE under its other identity. */
+          if (!parse_ue_beacon(p.Data.data(), p.Data.size(), oc, area, true))
+            return;
           bool fwd = false;
           {
             std::lock_guard<std::mutex> lk(f1_mu);
@@ -1146,10 +1228,7 @@ int run_du(IRadio *dev, const Cfg &c) {
                             static_cast<double>(p.RxAtrib.snr[0]) / 2.0 /* raw dB*2 */, now_ms());
             fwd = daps_on && daps_ids.count({oc, ou}) > 0;
           }
-          /* DAPS: a handing-over UE heard under its other identity, and only
-           * an authentic one (its tag verifies with the network key; with
-           * per-cell keys this needs the other cell's context pre-staged). */
-          if (fwd && parse_ue_beacon(p.Data.data(), p.Data.size(), oc, auth))
+          if (fwd)
             forward_ul(oc, ou, p);
           return;
         }
@@ -1250,6 +1329,18 @@ int run_du(IRadio *dev, const Cfg &c) {
   });
 
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(c.secs);
+  ramp_t0 = std::chrono::steady_clock::now();
+  if (ramp_t0_unix > 0) {
+    const double now_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    ramp_t0 -= std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(now_unix - ramp_t0_unix));
+  }
+  if (!tx_ramp.empty()) { /* the anchor used: checkable afterwards */
+    char l[160];
+    snprintf(l, sizeof l, "{\"ev\":\"cell.du.txpwr_t0\",\"anchor\":\"%s\",\"t0_unix\":%.3f}",
+             ramp_t0_unix > 0 ? "unix" : "service_start", ramp_t0_unix);
+    emit(l);
+  }
   auto next_ta = std::chrono::steady_clock::now() + std::chrono::seconds(ta_every_s);
   auto next_sync = std::chrono::steady_clock::now() + std::chrono::milliseconds(sync_loop_ms);
   int64_t sf = grid->at(static_cast<int64_t>(dev->ReadTsf())).superframe + 1;
@@ -1476,6 +1567,7 @@ int run_du(IRadio *dev, const Cfg &c) {
               ie.effective_sf = static_cast<uint64_t>(static_cast<int64_t>(cmd.effective_net_sf) - off);
               ie.tsf_delta_us = cmd.tsf_delta_us;
               ie.channel = cmd.target_channel != c.ch ? cmd.target_channel : 0;
+              ie.ctx = cmd.ctx; /* the target's key for this UE: relayed, opaque */
               auto bytes = devourer::cell::encode_ho_ie(ie, auth);
               if (!bytes.empty()) {
                 std::lock_guard<std::mutex> lk(f1_mu);
@@ -1628,6 +1720,39 @@ int run_du(IRadio *dev, const Cfg &c) {
                "\"rate\":%d,\"late_us\":%lld,\"ok\":%d}",
                ue, (long long)sf, tx->seq, tx->attempt, rate, (long long)(sub - start), ok ? 1 : 0);
       emit(l);
+    }
+    /* CELL_DU_TX_RAMP (test): the DU's TX power offset over time, beacons
+     * and DL alike — what a UE crossing from this cell to another sees. */
+    if (!tx_ramp.empty()) {
+      const double ts = std::chrono::duration<double>(std::chrono::steady_clock::now() - ramp_t0).count();
+      double want = tx_ramp.back().second;
+      for (size_t i = 0; i < tx_ramp.size(); ++i) {
+        if (ts < tx_ramp[i].first) {
+          if (i == 0) {
+            want = tx_ramp[0].second;
+          } else {
+            const auto &a = tx_ramp[i - 1], &b = tx_ramp[i];
+            want = a.second + (b.second - a.second) * (ts - a.first) / (b.first - a.first);
+          }
+          break;
+        }
+      }
+      const int want_qdb = static_cast<int>(std::lround(want * 4));
+      if (std::abs(want_qdb - ramp_set_qdb) >= 2 || ramp_set_qdb == INT_MIN) { /* 0.5 dB steps */
+        const int applied = dev->SetTxPowerOffsetQdb(want_qdb);
+        /* The family clamps to its PA window (the applied value says so,
+         * logged below); retrying the same target cannot change that. */
+        ramp_set_qdb = want_qdb;
+        if (applied != want_qdb && !ramp_short_warned) {
+          ramp_short_warned = true;
+          fprintf(stderr, "CELL_DU_TX_RAMP: wanted %d qdB, applied %d (clamped)\n", want_qdb, applied);
+        }
+        char l[160];
+        snprintf(l, sizeof l,
+                 "{\"ev\":\"cell.du.txpwr\",\"sf\":%lld,\"t_s\":%.2f,\"want_qdb\":%d,\"applied_qdb\":%d}",
+                 (long long)sf, ts, want_qdb, applied);
+        emit(l);
+      }
     }
     // Idle part of the superframe: refresh the freerun reference, run the TA
     // loop, republish the map when a TA moved.
@@ -2007,7 +2132,7 @@ int run_du(IRadio *dev, const Cfg &c) {
      * learn a list went away, and its tag is what proves a beacon is this
      * cell's to anyone measuring it. */
     if (synced && f1_on) {
-      const auto nl = devourer::cell::encode_nl_ie(c.cell, nl_gen_snap, nb_snap, auth);
+      const auto nl = devourer::cell::encode_nl_ie(c.cell, nl_gen_snap, nb_snap, area);
       ho_ies.insert(ho_ies.end(), nl.begin(), nl.end());
     }
     if (changed || rar_now != rar_on_air || ho_ies != ho_on_air) {
@@ -2017,7 +2142,7 @@ int run_du(IRadio *dev, const Cfg &c) {
                             : ho_eff ? *ho_eff
                                      : static_cast<uint64_t>(sf + 3);
       }
-      const auto nb = build_du_beacon(next, rar_now, ho_ies);
+      const auto nb = build_du_beacon(next, auth, rar_now, ho_ies);
       const bool ok = !nb.empty() && dev->UpdateBeaconPayload(nb.data(), nb.size());
       beacon_fail_run = ok ? 0 : beacon_fail_run + 1;
       if (ok) {
@@ -2188,7 +2313,45 @@ int run_ue(IRadio *dev, const Cfg &c) {
   dev->SetCcaMode(true);
   bool ue_autonomous = false; /* the DU's kGrantAutonomous, followed */
 
-  const CellMac auth = cell_auth(c);
+  /* The serving cell's key: a handover switches it (src/cell/Keys.h — per-
+   * cell keys when CELL_AREA_KEY is set; else one shared key that never
+   * changes). Read under a small lock: the RX thread verifies with it. */
+  struct CellKey {
+    std::mutex m;
+    std::string hex;
+    CellMac mac;
+  };
+  auto cur_key = std::make_shared<CellKey>();
+  cur_key->hex = c.psk;
+  cur_key->mac = hmac_sha1(c.psk);
+  const CellMac auth =
+      c.psk.empty() ? CellMac{}
+                    : CellMac([cur_key](const uint8_t *d, size_t n, uint8_t out[20]) {
+                        CellMac m;
+                        {
+                          std::lock_guard<std::mutex> lk(cur_key->m);
+                          m = cur_key->mac;
+                        }
+                        return m && m(d, n, out);
+                      });
+  auto cell_key_hex = [cur_key] {
+    std::lock_guard<std::mutex> lk(cur_key->m);
+    return cur_key->hex;
+  };
+  auto set_cell_key = [cur_key](const std::string &hex) {
+    std::lock_guard<std::mutex> lk(cur_key->m);
+    cur_key->hex = hex;
+    cur_key->mac = hmac_sha1(hex);
+  };
+  const CellMac area = area_auth(c);
+  const char *area_env = std::getenv("CELL_AREA_KEY");
+  const bool per_cell_keys = area_env && *area_env;
+  /* Its own key (home cell, home UE): unwraps the target cell's key a
+   * handover carries. */
+  const char *uk = std::getenv("CELL_UE_KEY");
+  const CellMac ue_key_mac = uk && *uk ? hmac_sha1(uk) : CellMac{};
+  if (per_cell_keys && !ue_key_mac)
+    fprintf(stderr, "CELL_AREA_KEY without CELL_UE_KEY: this UE cannot hand over\n");
   std::mutex mu;  // guards sync, wrap, rxr
   devourer::TsfSync sync;
   /* A step of the DU's TSF re-anchors the fit instead of reading as skew:
@@ -2213,6 +2376,9 @@ int run_ue(IRadio *dev, const Cfg &c) {
   double dl_snr_sum = 0;
   uint64_t dl_snr_n = 0;
   uint64_t dl_new = 0, dl_dup = 0;
+  /* Serving beacons whose grant map is intact but not authentic (another
+   * key, or none): refused (mu). */
+  uint64_t gm_ok = 0, gm_refused = 0;
   const int64_t P = static_cast<int64_t>(c.tu) * devourer::cell::kTuUs;
   /* The capacity grid (same env as the DU): positions never move. */
   const std::optional<SlotGrid> grid = grid_for(c);
@@ -2226,6 +2392,9 @@ int run_ue(IRadio *dev, const Cfg &c) {
    * serving DU's beacon addressed to us, the one accepted (fresh, instant
    * ahead), and the target's grant maps heard while waiting for it. */
   std::optional<devourer::cell::HoIe> ho_seen, ho_pending;
+  std::string ho_target_key;  /* the accepted handover's target key (hex) */
+  CellMac target_auth;        /* ... as a Mac: the target's buffered maps (mu) */
+  uint32_t ho_no_ctx_id = 0;  /* the last command refused for no context (logged once) */
   devourer::cell::HoReceiver horx;
   std::optional<GrantMapReceiver> rxr_target;
   uint8_t tgt_du_mac[6] = {0};
@@ -2265,6 +2434,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
   std::optional<uint8_t> retune_to;
   std::atomic<int64_t> retune_done_us{0}; /* steady clock, 0 = none pending */
   struct HoBack {
+    std::string key;     /* the source cell's key, to return to */
     uint8_t channel = 0; /* the source's channel, to return to */
     uint16_t cell = 0, ue = 0;
     int64_t delta_us = 0;
@@ -2300,10 +2470,18 @@ int run_ue(IRadio *dev, const Cfg &c) {
     joiner_mac = {0x02, 0xce, 0xfe, static_cast<uint8_t>(h >> 16), static_cast<uint8_t>(h >> 8),
                   static_cast<uint8_t>(h)};
   }
-  const uint64_t nonce = (static_cast<uint64_t>(rng()) << 32) | rng();
+  uint64_t nonce = (static_cast<uint64_t>(rng()) << 32) | rng();
+  /* A UE that got its id through the RACH re-joins once the DU's authentic
+   * map in force has not granted it for CELL_UE_REJOIN_SF superframes: the
+   * DU restarted (a new instance does not know the id) or released it. A
+   * static UE (CELL_UE > 0) never does: its DU grants it again. */
+  const bool static_ue = me_a > 0;
+  const int64_t rejoin_sf = envl("CELL_UE_REJOIN_SF", 30, 0, 100000); /* 0 = never */
+  int64_t absent_from_sf = -1; /* first superframe of the current absence */
+  int rejoin_stop_fails = 0;   /* consecutive failed beacon stops before a re-join */
   devourer::cell::RachClient rach(joiner_mac, nonce, [&rng] { return static_cast<uint32_t>(rng()); });
   std::vector<devourer::cell::RachResponse> rar_seen;
-  const auto mac = rach_mac(c);
+  const CellMac &mac = auth; /* the RACH: the serving cell's key */
   const auto rach_idx = grid->find(SlotKind::Rach, 0);
 
   std::thread rx([&] {
@@ -2319,7 +2497,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
          * measured: a frame merely carrying a cell-shaped address is not. */
         if (p.Data[10] == 0x02 && p.Data[11] == 0xce && p.Data[12] == 0x11 && p.Data[15] == 0) {
           const uint16_t bc = static_cast<uint16_t>(p.Data[13] << 8 | p.Data[14]);
-          if (auto nl = devourer::cell::find_nl_ie(p.Data.data(), p.Data.size(), bc, auth)) {
+          if (auto nl = devourer::cell::find_nl_ie(p.Data.data(), p.Data.size(), bc, area)) {
             ue_meas.update(bc, 0, static_cast<double>(p.RxAtrib.rssi[0]) - 110.0,
                            static_cast<double>(p.RxAtrib.snr[0]) / 2.0 /* raw dB*2 */, ue_ms());
             /* The serving cell's list: only a generation not older than the
@@ -2337,7 +2515,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
            * switch (they do not feed the clock: that is the source's until
            * the switch, then shifted, not re-acquired). */
           if (rxr_target && std::memcmp(p.Data.data() + 10, tgt_du_mac, 6) == 0)
-            if (auto m = devourer::cell::find_grant_map(p.Data.data(), p.Data.size()))
+            if (auto m = devourer::cell::find_grant_map(p.Data.data(), p.Data.size(), target_auth))
               rxr_target->offer(*m);
           return;
         }
@@ -2364,7 +2542,18 @@ int run_ue(IRadio *dev, const Cfg &c) {
           reattach_armed_steps = sync.Steps();
           reattach_until_ms = ue_ms() + reattach_sf * P / 1000;
         }
-        if (auto m = devourer::cell::find_grant_map(p.Data.data(), p.Data.size())) {
+        auto m = devourer::cell::find_grant_map(p.Data.data(), p.Data.size(), auth);
+        if (m) {
+          ++gm_ok;
+        } else if (auth && devourer::cell::find_grant_map(p.Data.data(), p.Data.size(), {})) {
+          if (gm_refused++ == 0) {
+            char l[120];
+            snprintf(l, sizeof l, "{\"ev\":\"cell.ue.gm_refused\",\"ue\":%d,\"cell\":%u}",
+                     me_a.load(), cell_a.load());
+            emit(l);
+          }
+        }
+        if (m) {
           const uint32_t old_epoch = rxr.newest_epoch();
           if (!rxr.offer(*m) && ue_ms() < reattach_until_ms &&
               rxr.offer_after_restart(*m, static_cast<uint64_t>(*eg) / static_cast<uint64_t>(P))) {
@@ -2506,8 +2695,28 @@ int run_ue(IRadio *dev, const Cfg &c) {
        * identity becomes the target's, and the target's buffered grant
        * maps take over. No scan, no re-acquisition, no association. */
       if (ho_seen) {
-        if (horx.accept(*ho_seen, static_cast<uint64_t>(sfn))) {
+        /* Per-cell keys: the target's key, unwrapped from the context the IE
+         * carries for this UE alone. Without one (or a context not for this
+         * UE) the command is not taken — the target could not be verified. */
+        std::optional<std::string> tkey;
+        if (per_cell_keys) {
+          const bool none = std::all_of(ho_seen->ctx.begin(), ho_seen->ctx.end(),
+                                        [](uint8_t b) { return b == 0; });
+          if (auto k = none || !ue_key_mac ? std::nullopt
+                                           : devourer::cell::unwrap_context(ue_key_mac, ho_seen->id,
+                                                                            ho_seen->target, ho_seen->ctx))
+            tkey = devourer::cell::key_to_hex(*k);
+          if (!tkey && ho_seen->id != ho_no_ctx_id) {
+            ho_no_ctx_id = ho_seen->id;
+            char l[120];
+            snprintf(l, sizeof l, "{\"ev\":\"cell.ue.ho_no_context\",\"id\":%u}", ho_seen->id);
+            emit(l);
+          }
+        }
+        if ((!per_cell_keys || tkey) && horx.accept(*ho_seen, static_cast<uint64_t>(sfn))) {
           ho_pending = ho_seen;
+          ho_target_key = tkey ? *tkey : cell_key_hex();
+          target_auth = hmac_sha1(ho_target_key);
           rxr_target.emplace(ho_pending->target);
           cell_mac(tgt_du_mac, ho_pending->target, 0);
           char l[220];
@@ -2526,6 +2735,8 @@ int run_ue(IRadio *dev, const Cfg &c) {
         const int64_t before = du_now;
         sync.ShiftRemote(h.tsf_delta_us);
         du_now = sync.RemoteForLocal(static_cast<uint64_t>(wrap.extend(static_cast<uint32_t>(f))));
+        const std::string source_key = cell_key_hex();
+        set_cell_key(ho_target_key); /* the target's key from now (the same one if shared) */
         cell_a.store(h.target);
         me_a.store(h.target_ue);
         cell_mac(du_mac, h.target, 0);
@@ -2549,7 +2760,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
                  (long long)h.tsf_delta_us, (long long)before, (long long)du_now);
         emit(l);
         rearm_ack = true;
-        ho_back = HoBack{cur_ch, h.cell, h.ue, h.tsf_delta_us, sfn + ho_fallback_sf, h.id};
+        ho_back = HoBack{source_key, cur_ch, h.cell, h.ue, h.tsf_delta_us, sfn + ho_fallback_sf, h.id};
         if (h.channel != 0 && h.channel != cur_ch)
           retune_to = h.channel; /* inter-frequency: done right after this lock */
       }
@@ -2567,6 +2778,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
             retune_to = b.channel; /* back to the source's channel */
           sync.ShiftRemote(-b.delta_us);
           du_now = sync.RemoteForLocal(static_cast<uint64_t>(wrap.extend(static_cast<uint32_t>(f))));
+          set_cell_key(b.key); /* back to the source's key */
           cell_a.store(b.cell);
           me_a.store(b.ue);
           cell_mac(du_mac, b.cell, 0);
@@ -2758,8 +2970,49 @@ int run_ue(IRadio *dev, const Cfg &c) {
       continue;
     const int me = me_a.load();
     const Grant *g = mcopy.find(static_cast<uint16_t>(me));
-    if (!g)
+    if (!g) {
+      /* Not granted by the map in force. A joined UE (not mid-handover)
+       * absent this long re-joins: a fresh nonce (the DU answers a
+       * repeated one from its cache: the old id), its uplink beacon off,
+       * the id's DL sequence space gone. */
+      const int64_t sf_now = du_now / P;
+      if (absent_from_sf < 0)
+        absent_from_sf = sf_now;
+      if (!static_ue && rejoin_sf > 0 && !ho_back && !ho_pending &&
+          sf_now - absent_from_sf >= rejoin_sf) {
+        const int old_ue = me;
+        /* The old id's beacon must be off first: a failed stop defers the
+         * re-join to the next pass (the absence stands), never a RACH
+         * beside a live old beacon. */
+        if (beaconing && !dev->StopBeacon()) {
+          if (rejoin_stop_fails++ == 0) {
+            char l[120];
+            snprintf(l, sizeof l, "{\"ev\":\"cell.ue.rejoin_stop_fail\",\"ue\":%d}", old_ue);
+            emit(l);
+          }
+          continue;
+        }
+        beaconing = false;
+        rejoin_stop_fails = 0;
+        dev->ClearAckResponder();
+        nonce = (static_cast<uint64_t>(rng()) << 32) | rng();
+        rach = devourer::cell::RachClient(joiner_mac, nonce, [&rng] { return static_cast<uint32_t>(rng()); });
+        {
+          std::lock_guard<std::mutex> lk(mu);
+          rar_seen.clear();
+          hrx = HarqReceiver{};
+        }
+        me_a = 0;
+        char l[200];
+        snprintf(l, sizeof l,
+                 "{\"ev\":\"cell.ue.rejoin\",\"old_ue\":%d,\"cell\":%u,\"absent_sf\":%lld,\"sf\":%lld}",
+                 old_ue, cell_a.load(), (long long)(sf_now - absent_from_sf), (long long)sf_now);
+        emit(l);
+        absent_from_sf = -1;
+      }
       continue;
+    }
+    absent_from_sf = -1;
     /* The DU's slot indices must mean the same slots on this UE's grid (the
      * grid is built from the shared env): a disagreement is a configuration
      * error. Stop rather than transmit in someone else's slot. The pair may
@@ -2821,7 +3074,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
                                fb.base != last_fb.base || fb.bitmap != last_fb.bitmap ||
                                snr_gen != last_snr_gen;
     if (content_moved) {
-      auto b = build_ue_beacon(cell_a.load(), me, c.tu, mcopy.epoch, fb, snr_half, snr_gen, auth);
+      auto b = build_ue_beacon(cell_a.load(), me, c.tu, mcopy.epoch, fb, snr_half, snr_gen, auth, area);
       {
         std::vector<devourer::cell::MeasEntryUe> mr;
         {
@@ -2836,6 +3089,18 @@ int run_ue(IRadio *dev, const Cfg &c) {
           /* Its generation: the serving superframe, strictly increasing (the
            * DU refuses anything not newer, and far from its own count). */
           mr_gen = std::max(mr_gen + 1, static_cast<uint32_t>(du_now / P));
+          {
+            std::string cells;
+            for (const auto &e : mr) {
+              char b2[48];
+              snprintf(b2, sizeof b2, "%s\"%u\":%d", cells.empty() ? "" : ",", e.cell, e.rssi_dbm);
+              cells += b2;
+            }
+            char l[300];
+            snprintf(l, sizeof l, "{\"ev\":\"cell.ue.mr\",\"ue\":%d,\"cell\":%u,\"sf\":%lld,\"rssi\":{%s}}",
+                     me, cell_a.load(), (long long)(du_now / P), cells.c_str());
+            emit(l);
+          }
           const auto ie =
               devourer::cell::encode_mr_ie(cell_a.load(), static_cast<uint16_t>(me), mr_gen, mr, auth);
           b.insert(b.end(), ie.begin(), ie.end());
@@ -3043,18 +3308,23 @@ int run_ue(IRadio *dev, const Cfg &c) {
   dev->StopRxLoop();
   rx.join();
   dev->ClearAckResponder();
-  char l[200];
+  char l[300];
   snprintf(l, sizeof l,
            "{\"ev\":\"cell.ue.done\",\"ue\":%u,\"steps\":%ld,\"step_fails\":%ld,"
-           "\"listen_from_sf\":%lld,\"listen_to_sf\":%lld,\"dl_new\":%llu,\"dl_dup\":%llu}",
+           "\"listen_from_sf\":%lld,\"listen_to_sf\":%lld,\"dl_new\":%llu,\"dl_dup\":%llu,"
+           "\"keyed\":%d,\"gm_ok\":%llu,\"gm_refused\":%llu}",
            me_a.load(), steps, step_fails, (long long)listen_from, (long long)listen_to,
-           (unsigned long long)dl_new, (unsigned long long)dl_dup);
+           (unsigned long long)dl_new, (unsigned long long)dl_dup, auth ? 1 : 0,
+           (unsigned long long)gm_ok, (unsigned long long)gm_refused);
   emit(l);
   return 0;
 }
 
 // ---------------------------------------------------------------------------
 int run_witness(IRadio *dev, const Cfg &c) {
+  /* With CELL_PSK, a beacon's grant map counts only if authentic; without
+   * one the witness is a passive recorder (structure only). */
+  const CellMac wauth = cell_auth(c);
   /* CELL_WITNESS_CELLS [CELL_ID]: the cells to record (M5: two co-channel
    * cells on one receiver clock); each line names its cell. */
   std::vector<uint16_t> cells;
@@ -3091,7 +3361,7 @@ int run_witness(IRadio *dev, const Cfg &c) {
         if (st > 0) {
           if (auto ub = parse_ue_beacon(d, p.Data.size(), cell))
             ep = ub->epoch;
-        } else if (auto m = devourer::cell::find_grant_map(d, p.Data.size())) {
+        } else if (auto m = devourer::cell::find_grant_map(d, p.Data.size(), wauth)) {
           ep = m->epoch;
         }
         snprintf(l, sizeof l,

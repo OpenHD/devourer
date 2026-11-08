@@ -654,6 +654,83 @@ int main() {
     CHECK(!unwrap_context(uk, 77, 2, Context{}));                 /* none */
     CHECK(*wrap_context(uk, 78, 2, *b2) != *ctx);                 /* the pad is per id */
     CHECK(!wrap_context(Mac{}, 77, 2, *b2));                      /* no UE key: no context */
+    /* A joiner's key: bound to the MAC it joins with, distinct from any
+     * static UE key and from another joiner's. */
+    const std::array<uint8_t, 6> jm = {0x02, 0xce, 0xfe, 0x51, 0x99, 0x46};
+    auto jm2 = jm;
+    jm2[5] ^= 1;
+    const auto kj = joiner_key(master, jm);
+    CHECK(kj && kj->size() == 40 && *kj == *joiner_key(master, jm));
+    CHECK(*kj != *joiner_key(master, jm2) && *kj != *u11 && *kj != *k1);
+    /* The DU reports each UE's home (F1 v10): static or a joiner's MAC. */
+    f1::Report jr;
+    jr.du = 1;
+    jr.homes = {{1, HomeId{false, 1, 1, {}}}, {2, HomeId{true, 0, 0, jm}}};
+    const auto wj = f1::encode_report(jr, fake_mac(0xF1));
+    auto dj = f1::decode_report(wj.data(), wj.size(), fake_mac(0xF1));
+    CHECK(dj && dj->homes == jr.homes);
+    CHECK(*home_key(master, jr.homes[0].home) == *u11 && *home_key(master, jr.homes[1].home) == *kj);
+    jr.homes.resize(f1::kMaxUes + 1);
+    CHECK(f1::encode_report(jr, fake_mac(0xF1)).empty());
+    /* The handover command carries the home to the target. */
+    HoCommand hc;
+    hc.id = 9;
+    hc.home = HomeId{true, 0, 0, jm};
+    const auto wh = f1::encode_handover(2, hc, fake_mac(0xF1));
+    auto dh = f1::decode_handover(wh.data(), wh.size(), fake_mac(0xF1));
+    CHECK(dh && dh->second.home == hc.home);
+    auto badk = wh;
+    badk[badk.size() - 8 - 7] = 2; /* home kind 2: unknown */
+    CHECK(!f1::decode_handover(badk.data(), badk.size(), Mac{}));
+    /* Per-UE area keys: A_u from the UE's key, wrapped for one DU. */
+    const auto au = ue_area_key(fake_mac(0x11));
+    CHECK(au && *au != *ue_area_key(fake_mac(0x12)));             /* per UE */
+    const auto raw = key_from_hex(*au);
+    const Mac duk = fake_mac(0xD2);
+    const auto w1 = wrap_area_key(duk, 1, 1, 100, *raw);
+    CHECK(w1 && *w1 != *raw && wrap_area_key(duk, 1, 1, 100, *w1) == raw); /* its own inverse */
+    CHECK(*wrap_area_key(duk, 1, 1, 101, *raw) != *w1);           /* a fresh nonce, a fresh pad */
+    CHECK(wrap_area_key(fake_mac(0xD3), 1, 1, 100, *w1) != raw);  /* another DU's key */
+    f1::AreaKeys ak;
+    ak.du = 2;
+    ak.seq = 5;
+    ak.keys = {{1, 1, 100, *w1}};
+    const auto wak = f1::encode_area_keys(ak, fake_mac(0xF1));
+    CHECK(f1::peek_type(wak.data(), wak.size()) == f1::Type::AreaKeys);
+    auto dak = f1::decode_area_keys(wak.data(), wak.size(), fake_mac(0xF1));
+    CHECK(dak && *dak == ak);
+    CHECK(!f1::decode_area_keys(wak.data(), wak.size(), fake_mac(0xF2)));
+    ak.keys.resize(f1::kMaxAreaKeys);
+    const auto wfull = f1::encode_area_keys(ak, fake_mac(0xF1));
+    CHECK(!wfull.empty() && wfull.size() <= f1::kMaxDatagram);
+    ak.keys.resize(f1::kMaxAreaKeys + 1);
+    CHECK(f1::encode_area_keys(ak, fake_mac(0xF1)).empty());
+    /* The report flags the DU's per-cell keys (F1 v11): a CU without the
+     * master refuses such a DU. Unknown flag bits are refused. */
+    f1::Report pf;
+    pf.du = 1;
+    pf.coordinated = true;
+    pf.per_cell_keys = true;
+    const auto wpf = f1::encode_report(pf, Mac{});
+    auto dpf = f1::decode_report(wpf.data(), wpf.size(), Mac{});
+    CHECK(dpf && dpf->per_cell_keys && dpf->coordinated);
+    auto bpf = wpf;
+    bpf[4 + 2 + 1 + 1] = 4; /* du(2) tier(1) sync_state(1), then the flags */
+    CHECK(!f1::decode_report(bpf.data(), bpf.size(), Mac{}));
+    /* A report at EVERY list bound still fits the F1 datagram both sides
+     * receive into. */
+    f1::Report big;
+    big.fixed.resize(f1::kMaxFixed);
+    big.positions.resize(f1::kMaxPositions);
+    big.ues.resize(f1::kMaxUes);
+    big.heard.resize(f1::kMaxHeard);
+    big.meas.resize(f1::kMaxUes);
+    big.ue_meas.resize(f1::kMaxUeMeas);
+    big.homes.resize(f1::kMaxUes);
+    const auto wb = f1::encode_report(big, fake_mac(0xF1));
+    CHECK(!wb.empty() && wb.size() <= f1::kMaxDatagram);
+    std::printf("cell_m6: a report at every bound: %zu bytes (datagram %zu)\n", wb.size(), f1::kMaxDatagram);
+
     /* It rides the handover command (F1 v9) and the IE (v3) intact. */
     HoCommand cmd;
     cmd.id = 77;
@@ -683,6 +760,102 @@ int main() {
     auto tamper = bcn;
     tamper[36 + 5 + 34 + 3] ^= 1; /* a context byte: the CRC and the tag cover it */
     CHECK(!find_ho_ie(tamper.data(), tamper.size(), 1, 1, ck1));
+  }
+
+  /* --- Signed neighbour lists (MeasGap.h NlVerifier). A fake signature
+   * scheme stands in for Ed25519 (the logic, not the crypto): a "public key"
+   * names its private one, sig = fake_mac(key)(msg) padded. --- */
+  {
+    auto fake_pub = [](uint8_t k) { Ed25519Pub p{}; p[0] = k; return p; };
+    auto signer = [](uint8_t k) -> NlSigner {
+      return [k](const uint8_t *m, size_t n, uint8_t sig[64]) {
+        std::memset(sig, 0, 64);
+        return fake_mac(k)(m, n, sig);
+      };
+    };
+    const NlSigVerifier verify = [](const uint8_t pub[32], const uint8_t *m, size_t n, const uint8_t sig[64]) {
+      uint8_t want[64] = {0};
+      fake_mac(pub[0])(m, n, want);
+      return std::memcmp(want, sig, 64) == 0;
+    };
+    const uint8_t ca = 0x5A, k2 = 0x22, k3 = 0x33;
+    /* The CA certifies cell 2's key. */
+    Ed25519Sig cert2{};
+    {
+      const auto m = nl_cert_message(2, fake_pub(k2));
+      signer(ca)(m.data(), m.size(), cert2.data());
+    }
+    auto beacon = [&](uint16_t cell, uint32_t gen, std::vector<Neighbour> list, uint8_t sign_key,
+                      bool with_sig, const Ed25519Pub &cert_pub, const Ed25519Sig &cert_sig) {
+      std::vector<uint8_t> b(36, 0);
+      b[0] = 0x80;
+      const auto nl = encode_nl_ie(cell, gen, list, Mac{});
+      b.insert(b.end(), nl.begin(), nl.end());
+      if (with_sig) {
+        const auto sg = encode_nl_sig_ie(cell, gen, nl, signer(sign_key));
+        b.insert(b.end(), sg.begin(), sg.end());
+      }
+      const auto ce = encode_nl_cert_ie(cell, cert_pub, cert_sig);
+      b.insert(b.end(), ce.begin(), ce.end());
+      return b;
+    };
+    const std::vector<Neighbour> l1 = {{1, 149, 51200}};
+    NlVerifier v(fake_pub(ca), verify);
+    auto good = beacon(2, 7, l1, k2, true, fake_pub(k2), cert2);
+    auto r = v.check(good.data(), good.size(), 2);
+    CHECK(r && r->gen == 7 && r->cells == l1);                       /* the chain holds */
+    auto nosig = beacon(2, 7, l1, k2, false, fake_pub(k2), cert2);
+    CHECK(v.check(nosig.data(), nosig.size(), 2));                   /* the same list, verified before */
+    const std::vector<Neighbour> l2 = {{1, 149, 12345}};
+    auto changed = beacon(2, 7, l2, k2, false, fake_pub(k2), cert2);
+    CHECK(!v.check(changed.data(), changed.size(), 2));              /* a new list needs its signature */
+    auto forged = beacon(2, 8, l2, k3, true, fake_pub(k2), cert2);
+    CHECK(!v.check(forged.data(), forged.size(), 2));                /* signed by another key */
+    NlVerifier fresh(fake_pub(ca), verify);
+    auto selfcert = beacon(2, 8, l2, k3, true, fake_pub(k3), cert2);
+    CHECK(!fresh.check(selfcert.data(), selfcert.size(), 2));        /* a key the CA did not certify */
+    Ed25519Sig cert_other{};
+    {
+      const auto m = nl_cert_message(3, fake_pub(k2)); /* certified for cell 3, not 2 */
+      signer(ca)(m.data(), m.size(), cert_other.data());
+    }
+    auto wrongcell = beacon(2, 8, l2, k2, true, fake_pub(k2), cert_other);
+    CHECK(!fresh.check(wrongcell.data(), wrongcell.size(), 2));
+    {
+      /* A CRC-valid list whose signature (same cell, same gen) covers ANOTHER
+       * list: the signature is over the exact NL bytes. */
+      std::vector<uint8_t> swapped(36, 0);
+      swapped[0] = 0x80;
+      const auto nl_a = encode_nl_ie(2, 9, l1, Mac{});
+      const auto nl_b = encode_nl_ie(2, 9, l2, Mac{});
+      const auto sg = encode_nl_sig_ie(2, 9, nl_b, signer(k2));
+      const auto ce = encode_nl_cert_ie(2, fake_pub(k2), cert2);
+      for (const auto *ie : {&nl_a, &sg, &ce})
+        swapped.insert(swapped.end(), ie->begin(), ie->end());
+      CHECK(!fresh.check(swapped.data(), swapped.size(), 2));
+    }
+    auto okb = beacon(2, 9, l2, k2, true, fake_pub(k2), cert2);
+    CHECK(fresh.check(okb.data(), okb.size(), 2));
+    CHECK(!fresh.check(okb.data(), okb.size(), 5));                  /* not cell 5's list */
+    {
+      /* A genuine signed list FOLLOWED by a forged CRC-valid one (same cell,
+       * same gen): refused — never the forged entries. Before any cache. */
+      NlVerifier v2(fake_pub(ca), verify);
+      auto dup = beacon(2, 11, l1, k2, true, fake_pub(k2), cert2);
+      const auto forged_nl = encode_nl_ie(2, 11, l2, Mac{});
+      dup.insert(dup.end(), forged_nl.begin(), forged_nl.end());
+      CHECK(!v2.check(dup.data(), dup.size(), 2));
+      /* ... and after the genuine one is cached. */
+      auto alone = beacon(2, 11, l1, k2, true, fake_pub(k2), cert2);
+      CHECK(v2.check(alone.data(), alone.size(), 2));
+      CHECK(!v2.check(dup.data(), dup.size(), 2));
+      /* The forged one first, the genuine one second: refused too. */
+      std::vector<uint8_t> rev(36, 0);
+      rev[0] = 0x80;
+      rev.insert(rev.end(), forged_nl.begin(), forged_nl.end());
+      rev.insert(rev.end(), alone.begin() + 36, alone.end());
+      CHECK(!v2.check(rev.data(), rev.size(), 2));
+    }
   }
 
   if (failures == 0)

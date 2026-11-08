@@ -59,9 +59,19 @@
 //                             With per-cell keys: THIS cell's key (K_c,
 //                             src/cell/Keys.h; a UE: its serving cell's).
 //   CELL_AREA_KEY             per-cell keys (Keys.h): the area key K_A, which
-//                             tags what another cell checks (the neighbour
-//                             list, the UE beacon's area tag). Unset = one
-//                             shared key (CELL_PSK) for everything.
+//                             tags the neighbour list (what a UE checks of
+//                             another cell). A UE beacon's area tag is then
+//                             the UE's OWN area key (from CELL_UE_KEY), which
+//                             a neighbour DU checks with the key the CU sends
+//                             it (F1 AreaKeys). Unset = one shared key
+//                             (CELL_PSK) for everything.
+//   CELL_NL_SIGN_KEY CELL_NL_CERT   DU: its Ed25519 NL signing seed (64 hex)
+//                             and the area CA's signature over its public key
+//                             (128 hex): the NL rides with its signature and
+//                             the certificate (src/cell/MeasGap.h).
+//   CELL_CA_PUB               UE: the area CA's public key (64 hex): a beacon
+//                             counts as a cell's (measured, its NL taken) only
+//                             through CA -> cell key -> NL.
 //   CELL_UE_KEY               UE, per-cell keys: its own key K_(c,u) (home
 //                             cell and id), which unwraps the target cell's
 //                             key a handover carries. Without it, or for a
@@ -366,6 +376,54 @@ CellMac hmac_sha1(const std::string &key) {
   return {};
 #endif
 }
+/* Ed25519 (OpenSSL) for signed neighbour lists (src/cell/MeasGap.h). */
+template <size_t N>
+std::optional<std::array<uint8_t, N>> hex_bytes(const char *h) {
+  if (h == nullptr || std::strlen(h) != 2 * N)
+    return std::nullopt;
+  std::array<uint8_t, N> out{};
+  for (size_t i = 0; i < N; ++i) {
+    unsigned v = 0;
+    if (std::sscanf(h + 2 * i, "%2x", &v) != 1)
+      return std::nullopt;
+    out[i] = static_cast<uint8_t>(v);
+  }
+  return out;
+}
+#if defined(DEVOURER_CELL_OPENSSL)
+/* The signer for a 32-byte seed, and its public key. */
+std::pair<devourer::cell::NlSigner, std::optional<devourer::cell::Ed25519Pub>>
+ed25519_signer(const std::array<uint8_t, 32> &seed) {
+  EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, seed.data(), seed.size());
+  if (!pk)
+    return {{}, std::nullopt};
+  devourer::cell::Ed25519Pub pub{};
+  size_t pl = pub.size();
+  const bool have_pub = EVP_PKEY_get_raw_public_key(pk, pub.data(), &pl) == 1 && pl == pub.size();
+  std::shared_ptr<EVP_PKEY> key(pk, EVP_PKEY_free);
+  devourer::cell::NlSigner sign = [key](const uint8_t *m, size_t n, uint8_t sig[64]) {
+    EVP_MD_CTX *c = EVP_MD_CTX_new();
+    size_t sl = 64;
+    const bool ok = c && EVP_DigestSignInit(c, nullptr, nullptr, nullptr, key.get()) == 1 &&
+                    EVP_DigestSign(c, sig, &sl, m, n) == 1 && sl == 64;
+    EVP_MD_CTX_free(c);
+    return ok;
+  };
+  return {sign, have_pub ? std::optional<devourer::cell::Ed25519Pub>(pub) : std::nullopt};
+}
+bool ed25519_verify(const uint8_t pub[32], const uint8_t *m, size_t n, const uint8_t sig[64]) {
+  EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pub, 32);
+  if (!pk)
+    return false;
+  EVP_MD_CTX *c = EVP_MD_CTX_new();
+  const bool ok = c && EVP_DigestVerifyInit(c, nullptr, nullptr, nullptr, pk) == 1 &&
+                  EVP_DigestVerify(c, sig, 64, m, n) == 1;
+  EVP_MD_CTX_free(c);
+  EVP_PKEY_free(pk);
+  return ok;
+}
+#endif
+
 CellMac cell_auth(const Cfg &c) { return hmac_sha1(c.psk); }
 /* The area key (src/cell/Keys.h): what another cell must be able to check —
  * the neighbour list and the UE beacon's area tag. CELL_AREA_KEY, else the
@@ -379,7 +437,7 @@ bool auth_ok(const Cfg &c) {
 #if !defined(DEVOURER_CELL_OPENSSL)
   /* Without OpenSSL a key would become an EMPTY authenticator — silently
    * unauthenticated: refused, for every key. */
-  for (const char *k : {"CELL_AREA_KEY", "CELL_UE_KEY"})
+  for (const char *k : {"CELL_AREA_KEY", "CELL_UE_KEY", "CELL_NL_SIGN_KEY", "CELL_NL_CERT", "CELL_CA_PUB"})
     if (const char *v = std::getenv(k); v && *v) {
       fprintf(stderr, "%s needs a build with OpenSSL\n", k);
       return false;
@@ -488,7 +546,19 @@ bool du_budget_ok(const Cfg &c, const std::vector<uint16_t> &ues) {
       rar[1] = 'B';
       rar[2] = static_cast<uint8_t>(devourer::cell::kRachMaxPerBeacon);
     }
-    const int64_t bcn_need = 22 + ofdm_airtime_us(build_du_beacon(probe, cell_auth(c), rar).size() + 4, 6);
+    /* ... + a full neighbour list, and with signed lists its signature and
+     * certificate (MeasGap.h) */
+    std::vector<uint8_t> extra = devourer::cell::encode_nl_ie(
+        c.cell, 0, std::vector<devourer::cell::Neighbour>(devourer::cell::kMaxNeighbours), {});
+    if (const char *sk = std::getenv("CELL_NL_SIGN_KEY"); sk && *sk) {
+      const auto sig = devourer::cell::encode_nl_sig_ie(
+          c.cell, 0, extra, [](const uint8_t *, size_t, uint8_t s[64]) { std::memset(s, 0, 64); return true; });
+      const auto cert = devourer::cell::encode_nl_cert_ie(c.cell, {}, {});
+      extra.insert(extra.end(), sig.begin(), sig.end());
+      extra.insert(extra.end(), cert.begin(), cert.end());
+    }
+    const int64_t bcn_need =
+        22 + ofdm_airtime_us(build_du_beacon(probe, cell_auth(c), rar, extra).size() + 4, 6);
     SlotBudget dl;
     dl.mpdu_len = build_dl_frame(c.cell, 1, 0, 0, pad).size() + 4;
     dl.acked = true;
@@ -539,6 +609,36 @@ int run_du(IRadio *dev, const Cfg &c) {
   }
   const CellMac auth = cell_auth(c);
   const CellMac area = area_auth(c);
+  const char *area_env_du = std::getenv("CELL_AREA_KEY");
+  const bool per_cell_keys = area_env_du && *area_env_du;
+  /* Signed neighbour lists (MeasGap.h): CELL_NL_SIGN_KEY (this DU's Ed25519
+   * seed, 64 hex) and CELL_NL_CERT (the CA's signature over its public key,
+   * 128 hex). The NL then rides with its signature and the certificate. */
+  devourer::cell::NlSigner nl_sign;
+  std::vector<uint8_t> nl_cert_ie;
+  {
+    const char *sk = std::getenv("CELL_NL_SIGN_KEY");
+    const char *ce = std::getenv("CELL_NL_CERT");
+    if ((sk && *sk) || (ce && *ce)) {
+      const auto seed = hex_bytes<32>(sk);
+      const auto cert = hex_bytes<64>(ce);
+#if defined(DEVOURER_CELL_OPENSSL)
+      auto [sg, pub] = seed ? ed25519_signer(*seed)
+                            : std::pair<devourer::cell::NlSigner, std::optional<devourer::cell::Ed25519Pub>>{};
+      if (!seed || !cert || !sg || !pub) {
+        fprintf(stderr, "CELL_NL_SIGN_KEY (64 hex) and CELL_NL_CERT (128 hex) go together\n");
+        return 2;
+      }
+      nl_sign = sg;
+      nl_cert_ie = devourer::cell::encode_nl_cert_ie(c.cell, *pub, *cert);
+#else
+      (void)seed;
+      (void)cert;
+#endif
+    }
+  }
+  std::vector<uint8_t> nl_signed_for, nl_sig_ie; /* the last NL signed, and its NS IE */
+  bool nl_sign_failed = false;
   const int64_t release_sf = envl("CELL_RELEASE_SF", 50, 2, 100000);
 
   /* M4 DU service mode (see the header): the PHC, the discipline loop, the
@@ -706,6 +806,12 @@ int run_du(IRadio *dev, const Cfg &c) {
     positions.push_back({static_cast<uint8_t>(*grid->find(SlotKind::Downlink, static_cast<uint16_t>(i))),
                          static_cast<uint8_t>(*grid->find(SlotKind::Uplink, static_cast<uint16_t>(i)))});
   devourer::cell::UeRegistry reg(positions);
+  /* Each UE's home identity (src/cell/Keys.h), recorded at its admission —
+   * static, a RACH joiner's MAC, or the home a handover command carries —
+   * and reported to the CU (F1 Report.homes) for the UE's handover context.
+   * Every admission writes it, so a reused id never keeps another UE's
+   * (f1_mu, after the threads start). */
+  std::map<uint16_t, devourer::cell::HomeId> ue_home;
   const bool rach_on = c.rach_us > 0;
   devourer::cell::RachServer srv(c.cell, reg, rach_mac(c));
   const auto rach_slot = grid->find(SlotKind::Rach, 0);
@@ -728,6 +834,7 @@ int run_du(IRadio *dev, const Cfg &c) {
     std::array<uint8_t, 6> m{};
     cell_mac(m.data(), c.cell, static_cast<uint8_t>(ue));
     map.grants.push_back(grant_for(*reg.bind(m)));
+    ue_home[ue] = devourer::cell::HomeId{false, c.cell, ue, {}};
   }
   /* A UE's id is its identity; its slot pair (capacity position) is the
    * grant's, which the CU (F1) may move. Positions are 1..capacity. */
@@ -788,7 +895,7 @@ int run_du(IRadio *dev, const Cfg &c) {
       pollfd pf{f1_fd.fd, POLLIN, 0};
       if (poll(&pf, 1, 50) <= 0 || !(pf.revents & POLLIN))
         continue;
-      uint8_t buf[2048];
+      uint8_t buf[f1::kMaxDatagram];
       sockaddr_storage from{};
       socklen_t fl = sizeof from;
       const ssize_t n = recvfrom(f1_fd.fd, buf, sizeof buf, 0, reinterpret_cast<sockaddr *>(&from), &fl);
@@ -1116,6 +1223,12 @@ int run_du(IRadio *dev, const Cfg &c) {
   uint32_t nl_gen = 1; /* bumped whenever the list changes (UEs refuse older) */
   bool have_nb_seq = false;
   uint64_t last_nb_seq = 0;
+  /* Per-cell keys: the other cells' UEs' own area keys (Keys.h A_u, F1
+   * AreaKeys from the CU, unwrapped with this cell's key), by (cell, UE);
+   * a heard UE beacon counts only with its own (f1_mu). */
+  std::map<std::pair<uint16_t, uint16_t>, CellMac> ue_area_tab;
+  bool have_ak_seq = false;
+  uint64_t last_ak_seq = 0;
   struct UeReport {
     std::vector<devourer::cell::MeasEntryUe> m;
     int64_t at_ms = 0;
@@ -1196,6 +1309,11 @@ int run_du(IRadio *dev, const Cfg &c) {
             std::lock_guard<std::mutex> lk(mu);
             a = srv.on_request(rf->msga, rf->msga_len, static_cast<uint64_t>(pos.superframe));
           }
+          if (a && a->status == devourer::cell::RachStatus::Granted) {
+            /* Its home: the (authenticated) MAC it joined with. */
+            std::lock_guard<std::mutex> lk(f1_mu);
+            ue_home[a->ue] = devourer::cell::HomeId{true, 0, 0, a->mac};
+          }
           char l[240];
           snprintf(l, sizeof l,
                    "{\"ev\":\"cell.rach\",\"sf\":%lld,\"phase_us\":%lld,\"in_slot\":%d,"
@@ -1218,8 +1336,17 @@ int run_du(IRadio *dev, const Cfg &c) {
         if (oc != c.cell && ou >= 1) {
           /* Only an authentic one counts (its AREA tag: this DU does not hold
            * the other cell's key) — as heard, and for DAPS forwarding of a
-           * handing-over UE under its other identity. */
-          if (!parse_ue_beacon(p.Data.data(), p.Data.size(), oc, area, true))
+           * handing-over UE under its other identity. Per-cell keys: with
+           * THAT UE's own area key (from the CU), none = not counted. */
+          CellMac amac = area;
+          if (per_cell_keys) {
+            std::lock_guard<std::mutex> lk(f1_mu);
+            auto it = ue_area_tab.find({oc, ou});
+            amac = it != ue_area_tab.end() ? it->second : CellMac{};
+            if (!amac)
+              return;
+          }
+          if (!parse_ue_beacon(p.Data.data(), p.Data.size(), oc, amac, true))
             return;
           bool fwd = false;
           {
@@ -1384,6 +1511,12 @@ int run_du(IRadio *dev, const Cfg &c) {
             r.fixed = layout.fixed;
             r.positions = layout.positions;
             r.ues = f1_view.ues;
+            r.per_cell_keys = per_cell_keys;
+            /* The homes of exactly the UEs this report names, read under the
+             * same lock (one view). */
+            for (const auto &u : r.ues)
+              if (auto h = ue_home.find(u.ue); h != ue_home.end() && r.homes.size() < f1::kMaxUes)
+                r.homes.push_back({u.ue, h->second});
             f1::fill_report_measurements(r, c.cell, meas_tab.snapshot(now_ms()));
             /* The UEs' own measurements (their MR IEs): each entry's age is its
              * sample's plus the report's since; each UE's serving entry first,
@@ -1421,7 +1554,7 @@ int run_du(IRadio *dev, const Cfg &c) {
         pollfd pf{f1_fd.fd, POLLIN, 0};
         if (poll(&pf, 1, 50) <= 0 || !(pf.revents & POLLIN))
           continue;
-        uint8_t buf[2048];
+        uint8_t buf[f1::kMaxDatagram];
         sockaddr_storage from{};
         socklen_t fl = sizeof from;
         const ssize_t n = recvfrom(f1_fd.fd, buf, sizeof buf, 0, reinterpret_cast<sockaddr *>(&from), &fl);
@@ -1429,6 +1562,22 @@ int run_du(IRadio *dev, const Cfg &c) {
           continue;
         if (!f1_from_cu(from))
           continue;
+        if (f1::peek_type(buf, static_cast<size_t>(n)) == f1::Type::AreaKeys) {
+          auto ak = f1::decode_area_keys(buf, static_cast<size_t>(n), f1_mac);
+          if (!ak || ak->du != c.cell || !auth)
+            continue;
+          std::map<std::pair<uint16_t, uint16_t>, CellMac> t;
+          for (const auto &e : ak->keys)
+            if (auto k = devourer::cell::wrap_area_key(auth, e.cell, e.ue, e.nonce, e.wrapped))
+              t[{e.cell, e.ue}] = hmac_sha1(devourer::cell::key_to_hex(*k));
+          std::lock_guard<std::mutex> lk(f1_mu);
+          if (have_ak_seq && ak->seq <= last_ak_seq)
+            continue; /* a replay or reordering */
+          have_ak_seq = true;
+          last_ak_seq = ak->seq;
+          ue_area_tab = std::move(t);
+          continue;
+        }
         if (f1::peek_type(buf, static_cast<size_t>(n)) == f1::Type::Neighbours) {
           auto nb = f1::decode_neighbours(buf, static_cast<size_t>(n), f1_mac);
           if (!nb || nb->du != c.cell)
@@ -1542,6 +1691,7 @@ int run_du(IRadio *dev, const Cfg &c) {
                 /* DAPS: the UE's source identity, heard here until the switch
                  * (+ the release window, for its last old-identity beacons). */
                 daps_ids[{cmd.source, cmd.ue}] = static_cast<int64_t>(eff) + ho_release_sf;
+                ue_home[cmd.target_ue] = cmd.home; /* reported on, for its next handover */
               } else {
                 std::lock_guard<std::mutex> lk(f1_mu);
                 ho_in.erase(cmd.target_ue);
@@ -2134,6 +2284,19 @@ int run_du(IRadio *dev, const Cfg &c) {
     if (synced && f1_on) {
       const auto nl = devourer::cell::encode_nl_ie(c.cell, nl_gen_snap, nb_snap, area);
       ho_ies.insert(ho_ies.end(), nl.begin(), nl.end());
+      if (nl_sign && !nl.empty()) { /* signed once per list, aired with it */
+        if (nl != nl_signed_for) {
+          nl_sig_ie = devourer::cell::encode_nl_sig_ie(c.cell, nl_gen_snap, nl, nl_sign);
+          if (!nl_sig_ie.empty()) {
+            nl_signed_for = nl;
+          } else if (!nl_sign_failed) { /* retried next beacon; logged once */
+            nl_sign_failed = true;
+            emit("{\"ev\":\"cell.nl.sign_fail\"}");
+          }
+        }
+        ho_ies.insert(ho_ies.end(), nl_sig_ie.begin(), nl_sig_ie.end());
+        ho_ies.insert(ho_ies.end(), nl_cert_ie.begin(), nl_cert_ie.end());
+      }
     }
     if (changed || rar_now != rar_on_air || ho_ies != ho_on_air) {
       if (changed) {
@@ -2350,8 +2513,34 @@ int run_ue(IRadio *dev, const Cfg &c) {
    * handover carries. */
   const char *uk = std::getenv("CELL_UE_KEY");
   const CellMac ue_key_mac = uk && *uk ? hmac_sha1(uk) : CellMac{};
-  if (per_cell_keys && !ue_key_mac)
-    fprintf(stderr, "CELL_AREA_KEY without CELL_UE_KEY: this UE cannot hand over\n");
+  /* Signed neighbour lists: with the CA's public key (CELL_CA_PUB, 64 hex) an
+   * NL counts — and with it the beacon as that cell's — only through the
+   * chain CA -> cell key -> NL (MeasGap.h NlVerifier), never by the area tag. */
+  std::optional<devourer::cell::NlVerifier> nlv;
+  if (const char *ca = std::getenv("CELL_CA_PUB"); ca && *ca) {
+    const auto pub = hex_bytes<32>(ca);
+    if (!pub) {
+      fprintf(stderr, "CELL_CA_PUB: 64 hex\n");
+      return 2;
+    }
+#if defined(DEVOURER_CELL_OPENSSL)
+    nlv.emplace(*pub, ed25519_verify);
+#endif
+  }
+  /* Its own area key (Keys.h A_u = HMAC(K_u, 'V')): its beacon's area tag,
+   * which only it (and, through the CU, the neighbour DUs) can produce. */
+  CellMac ue_area = area;
+  if (per_cell_keys && ue_key_mac)
+    if (auto a = devourer::cell::ue_area_key(ue_key_mac))
+      ue_area = hmac_sha1(*a);
+  if (per_cell_keys && !ue_key_mac) {
+    /* Its beacon's area tag is its own key (Keys.h A_u): without it no other
+     * cell's DU would ever count it as heard (or forward it for DAPS), and it
+     * could not hand over. */
+    fprintf(stderr, "CELL_AREA_KEY needs CELL_UE_KEY: without it no other cell hears this UE "
+                    "(its area tag) and it cannot hand over\n");
+    return 2;
+  }
   std::mutex mu;  // guards sync, wrap, rxr
   devourer::TsfSync sync;
   /* A step of the DU's TSF re-anchors the fit instead of reading as skew:
@@ -2497,7 +2686,8 @@ int run_ue(IRadio *dev, const Cfg &c) {
          * measured: a frame merely carrying a cell-shaped address is not. */
         if (p.Data[10] == 0x02 && p.Data[11] == 0xce && p.Data[12] == 0x11 && p.Data[15] == 0) {
           const uint16_t bc = static_cast<uint16_t>(p.Data[13] << 8 | p.Data[14]);
-          if (auto nl = devourer::cell::find_nl_ie(p.Data.data(), p.Data.size(), bc, area)) {
+          if (auto nl = nlv ? nlv->check(p.Data.data(), p.Data.size(), bc)
+                            : devourer::cell::find_nl_ie(p.Data.data(), p.Data.size(), bc, area)) {
             ue_meas.update(bc, 0, static_cast<double>(p.RxAtrib.rssi[0]) - 110.0,
                            static_cast<double>(p.RxAtrib.snr[0]) / 2.0 /* raw dB*2 */, ue_ms());
             /* The serving cell's list: only a generation not older than the
@@ -3074,7 +3264,7 @@ int run_ue(IRadio *dev, const Cfg &c) {
                                fb.base != last_fb.base || fb.bitmap != last_fb.bitmap ||
                                snr_gen != last_snr_gen;
     if (content_moved) {
-      auto b = build_ue_beacon(cell_a.load(), me, c.tu, mcopy.epoch, fb, snr_half, snr_gen, auth, area);
+      auto b = build_ue_beacon(cell_a.load(), me, c.tu, mcopy.epoch, fb, snr_half, snr_gen, auth, ue_area);
       {
         std::vector<devourer::cell::MeasEntryUe> mr;
         {

@@ -7,23 +7,43 @@
  *   area key   K_A       = hex(HMAC(master, 'A'))
  *   cell key   K_c       = hex(HMAC(master, 'C' cell(2)))
  *   UE key     K_(c,u)   = hex(HMAC(master, 'U' home_cell(2) home_ue(2)))
+ *   joiner key K_j       = hex(HMAC(master, 'J' joiner_mac(6)))  (a UE that
+ *                          joins through the RACH: its UE key, provisioned out
+ *                          of band against the MAC it joins with, as a SIM's)
  * (little-endian fields; the master is the HMAC key as given).
  *
  * Who holds what:
  *   DU of cell c   K_c (its CELL_PSK) and K_A (CELL_AREA_KEY)
  *   UE (home c,u)  K_c of its serving cell, K_A, and its own K_(c,u)
- *                  (CELL_UE_KEY)
+ *                  (CELL_UE_KEY); a joiner: its K_j there
+ * The DU records every UE's home when it admits it — a static UE its (cell,
+ * UE), a RACH joiner the MAC it joined with, a handover arrival the home the
+ * CU's command names — and reports it (F1 Report.homes). The CU wraps each
+ * context for the home in the SOURCE DU's current report: nothing survives
+ * only in CU memory (a CU restart, an id reused for another UE). Claiming
+ * another UE's MAC at the join gains nothing: only K_j's holder unwraps.
  *   CU             the master (RAN_MASTER_KEY)
  *
  * What each key tags:
  *   K_c   everything that controls cell c's UEs: the grant map, the handover
  *         IE, the DL body, the UE beacon's own tag (HARQ feedback), the MR IE,
  *         the RACH. A compromised DU or UE of one cell forges that cell only.
- *   K_A   what another cell must be able to check: the neighbour list (the
- *         provenance of a neighbour beacon a UE measures) and the UE beacon's
- *         second (area) tag, which neighbour DUs check before counting a UE as
- *         heard or forwarding it for DAPS. Anyone in the area can forge those
- *         two — measurements and DAPS presence, never control.
+ *   K_A   what a UE must check of ANOTHER cell: the neighbour list (the
+ *         provenance of a neighbour beacon it measures) — unless the DUs SIGN
+ *         it: then a UE checks it with the CA's public key alone (below) and
+ *         nobody but the cell's DU can make it.
+ *   Ed25519 seeds (32 bytes = HMAC(master, info 0) || HMAC(master, info 1)[0..12]):
+ *     a DU's NL signing key  info 'S' cell(2)  (CELL_NL_SIGN_KEY)
+ *     the area CA            info 'R'          (its public key: CELL_CA_PUB;
+ *                                               its signature over each DU's
+ *                                               public key: CELL_NL_CERT)
+ *     — the signing itself is provisioning's (MeasGap.h signed NL).
+ *   A_u   the UE's own area key, hex(HMAC(K_u, 'V')): its beacon's second
+ *         (area) tag, which neighbour DUs check before counting it as heard
+ *         or forwarding it for DAPS. The CU derives every A_u from the homes
+ *         the DUs report and sends each DU the other cells' UEs' (F1
+ *         AreaKeys), each wrapped under that DU's cell key with a fresh
+ *         nonce: no UE can forge another UE's area tag.
  *
  * The handover context. The UE needs the target cell's key before it switches
  * (to take the target's grant maps; after the switch, for everything). The CU
@@ -123,6 +143,70 @@ inline std::optional<std::string> ue_key(const Mac &master, uint16_t home_cell, 
   key_detail::le(i, home_ue, 2);
   auto k = key_detail::prf(master, i);
   return k ? std::optional<std::string>(key_to_hex(*k)) : std::nullopt;
+}
+
+/* A 32-byte Ed25519 seed from the master (see the header). */
+inline std::optional<std::array<uint8_t, 32>> ed25519_seed(const Mac &master, std::vector<uint8_t> info) {
+  info.push_back(0);
+  auto a = key_detail::prf(master, info);
+  info.back() = 1;
+  auto b = key_detail::prf(master, info);
+  if (!a || !b)
+    return std::nullopt;
+  std::array<uint8_t, 32> seed{};
+  std::copy(a->begin(), a->end(), seed.begin());
+  std::copy(b->begin(), b->begin() + 12, seed.begin() + 20);
+  return seed;
+}
+inline std::optional<std::array<uint8_t, 32>> nl_sign_seed(const Mac &master, uint16_t cell) {
+  std::vector<uint8_t> i = {'S'};
+  key_detail::le(i, cell, 2);
+  return ed25519_seed(master, i);
+}
+inline std::optional<std::array<uint8_t, 32>> ca_seed(const Mac &master) {
+  return ed25519_seed(master, {'R'});
+}
+
+/* A UE's home identity: where its UE key comes from. */
+struct HomeId {
+  bool joiner = false;
+  uint16_t cell = 0, ue = 0;      /* static */
+  std::array<uint8_t, 6> mac{};   /* joiner */
+  bool operator==(const HomeId &) const = default;
+};
+
+inline std::optional<std::string> joiner_key(const Mac &master, const std::array<uint8_t, 6> &mac) {
+  std::vector<uint8_t> i = {'J'};
+  i.insert(i.end(), mac.begin(), mac.end());
+  auto k = key_detail::prf(master, i);
+  return k ? std::optional<std::string>(key_to_hex(*k)) : std::nullopt;
+}
+
+inline std::optional<std::string> home_key(const Mac &master, const HomeId &h) {
+  return h.joiner ? joiner_key(master, h.mac) : ue_key(master, h.cell, h.ue);
+}
+
+/* A UE's own area key, from its UE key (`ue_mac` = HMAC keyed by it). */
+inline std::optional<std::string> ue_area_key(const Mac &ue_mac) {
+  auto k = key_detail::prf(ue_mac, {'V'});
+  return k ? std::optional<std::string>(key_to_hex(*k)) : std::nullopt;
+}
+/* One UE's area key wrapped for one DU (`du_mac` = HMAC keyed by that DU's
+ * cell key): key XOR HMAC(K_du, 'W' cell(2) ue(2) nonce(8)). The nonce is
+ * fresh per wrap, so the pad never repeats. Its own inverse. */
+inline std::optional<KeyBytes> wrap_area_key(const Mac &du_mac, uint16_t cell, uint16_t ue,
+                                             uint64_t nonce, const KeyBytes &key) {
+  std::vector<uint8_t> i = {'W'};
+  key_detail::le(i, cell, 2);
+  key_detail::le(i, ue, 2);
+  key_detail::le(i, nonce, 8);
+  auto pad = key_detail::prf(du_mac, i);
+  if (!pad)
+    return std::nullopt;
+  KeyBytes out{};
+  for (size_t k = 0; k < out.size(); ++k)
+    out[k] = static_cast<uint8_t>(key[k] ^ (*pad)[k]);
+  return out;
 }
 
 /* The context for one handover: the target's key wrapped for one UE

@@ -91,6 +91,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -293,12 +294,24 @@ int main() {
   };
   std::map<std::pair<uint16_t, uint16_t>, HoFlight> flights;
   /* The per-cell security context (src/cell/Keys.h): with RAN_MASTER_KEY the
-   * CU wraps the target cell's key for the UE in every handover command. A
-   * UE's key is its HOME identity's — where it was provisioned — which
-   * home_of follows across handovers (a target identity -> its home). */
+   * CU wraps the target cell's key in every handover command for the UE's
+   * HOME identity's key, as the SOURCE DU's current report names it
+   * (Report.homes: recorded by the DU at the admission — a static UE, a RACH
+   * joiner's MAC, or the home a handover command carried). Nothing of it is
+   * kept here: a restarted CU, or an id reused for another UE, cannot pick a
+   * stale home. No home reported: no context (the UE refuses the command). */
   const char *master_env = std::getenv("RAN_MASTER_KEY");
   const auto master = master_env && *master_env ? hmac_sha1(master_env) : devourer::cell::Mac{};
-  std::map<std::pair<uint16_t, uint16_t>, std::pair<uint16_t, uint16_t>> home_of;
+  std::mt19937_64 area_rng{std::random_device{}()}; /* AreaKeys wrap nonces */
+  auto home_name = [](const devourer::cell::HomeId &h) {
+    char b[24];
+    if (h.joiner)
+      snprintf(b, sizeof b, "J:%02x%02x%02x%02x%02x%02x", h.mac[0], h.mac[1], h.mac[2], h.mac[3],
+               h.mac[4], h.mac[5]);
+    else
+      snprintf(b, sizeof b, "%u:%u", h.cell, h.ue);
+    return std::string(b);
+  };
   std::map<std::pair<uint16_t, uint16_t>, int64_t> moved_at; /* new key -> switch time (ms) */
   /* Old keys of UEs that handed over: the source keeps reporting their last
    * measurement until it goes stale, which must not trigger again. */
@@ -443,7 +456,7 @@ int main() {
   while (std::chrono::steady_clock::now() < deadline) {
     pollfd pf{fd, POLLIN, 0};
     if (poll(&pf, 1, 50) > 0 && (pf.revents & POLLIN)) {
-      uint8_t buf[2048];
+      uint8_t buf[f1::kMaxDatagram];
       sockaddr_in from{};
       socklen_t fl = sizeof from;
       const ssize_t n = recvfrom(fd, buf, sizeof buf, 0, reinterpret_cast<sockaddr *>(&from), &fl);
@@ -536,6 +549,15 @@ int main() {
               plan_joining(std::chrono::steady_clock::now());
             continue;
           }
+          if (r && r->per_cell_keys && !master) {
+            /* A per-cell DU needs AreaKeys (its heard UEs, DAPS) and handover
+             * contexts: both come from the master key. */
+            fprintf(stderr, "DU %u runs per-cell keys (CELL_AREA_KEY) but RAN_MASTER_KEY is unset\n",
+                    r->du);
+            emit("{\"ev\":\"ran.config_error\",\"du\":" + std::to_string(r->du) +
+                 ",\"why\":\"per-cell DU, no RAN_MASTER_KEY\"}");
+            return 2;
+          }
           if (r) {
             /* Running: no longer joining (its assignment stays). */
             joining.erase(r->du);
@@ -586,7 +608,6 @@ int main() {
                  * earlier Staged ack may have been lost): cancel, retried. */
                 cancels[fl.cmd.id] = Cancel{fl.cmd};
                 ul.forget({fl.cmd.target, fl.cmd.target_ue}); /* the provisional alias */
-                home_of.erase({fl.cmd.target, fl.cmd.target_ue});
                 flights.erase(it); /* the A3 fires again later: a fresh command */
               } else if (!was) {
                 emit("{\"ev\":\"ran.ho_ack\",\"id\":" + std::to_string(fl.cmd.id) +
@@ -846,12 +867,16 @@ int main() {
                     sr.net_sf + static_cast<uint64_t>(age_us / sr.period_us) + ho_lead_sf;
                 cmd.tsf_delta_us = devourer::cell::ho_tsf_delta_us(sr.phase_us, sr.net_off, tr.phase_us,
                                                                    tr.net_off, sr.period_us);
-                const auto hi = home_of.find({cmd.source, cmd.ue});
-                const auto home = hi != home_of.end() ? hi->second : std::make_pair(cmd.source, cmd.ue);
+                std::optional<devourer::cell::HomeId> home;
+                for (const f1::UeHome &h : sr.homes)
+                  if (h.ue == cmd.ue)
+                    home = h.home;
+                if (home)
+                  cmd.home = *home; /* the target records it for target_ue */
                 bool ctx_ok = false;
-                if (master) {
+                if (master && home) {
                   const auto tk = devourer::cell::cell_key(master, cmd.target);
-                  const auto uk = devourer::cell::ue_key(master, home.first, home.second);
+                  const auto uk = devourer::cell::home_key(master, *home);
                   const auto raw = tk ? devourer::cell::key_from_hex(*tk) : std::nullopt;
                   if (raw && uk)
                     if (auto cx = devourer::cell::wrap_context(hmac_sha1(*uk), cmd.id, cmd.target, *raw)) {
@@ -859,7 +884,6 @@ int main() {
                       ctx_ok = true;
                     }
                 }
-                home_of[{cmd.target, cmd.target_ue}] = home;
                 flights[key] = HoFlight{cmd};
                 if (forcing) {
                   force_done = true;
@@ -871,10 +895,10 @@ int main() {
                 snprintf(b, sizeof b,
                          "{\"ev\":\"ran.ho_cmd\",\"id\":%u,\"ue\":%u,\"from\":%u,\"to\":%u,"
                          "\"target_ue\":%u,\"pos\":%u,\"effective_net_sf\":%llu,\"delta_us\":%lld,"
-                         "\"ctx\":%d,\"home\":\"%u:%u\"}",
+                         "\"ctx\":%d,\"home\":\"%s\"}",
                          cmd.id, cmd.ue, cmd.source, cmd.target, cmd.target_ue, cmd.target_pos,
                          (unsigned long long)cmd.effective_net_sf, (long long)cmd.tsf_delta_us,
-                         ctx_ok ? 1 : 0, home.first, home.second);
+                         ctx_ok ? 1 : 0, home ? home_name(*home).c_str() : "none");
                 emit(b);
               }
             }
@@ -888,7 +912,6 @@ int main() {
         auto sit = dus.find(fl.cmd.source), tit = dus.find(fl.cmd.target);
         if (sit == dus.end() || tit == dus.end()) {
           ul.forget({fl.cmd.target, fl.cmd.target_ue}); /* the provisional alias */
-          home_of.erase({fl.cmd.target, fl.cmd.target_ue});
           it = flights.erase(it);
           continue;
         }
@@ -908,9 +931,6 @@ int main() {
           emit(b);
           moved_at[{fl.cmd.target, fl.cmd.target_ue}] = tms;
           retired[{fl.cmd.source, fl.cmd.ue}] = tms;
-          /* The UE left its source identity: another UE may get it later, and
-           * must not inherit this one's home key. */
-          home_of.erase({fl.cmd.source, fl.cmd.ue});
           if (auto h = ho.find({fl.cmd.source, fl.cmd.ue}); h != ho.end()) {
             if (h->second.firing)
               log_clear(fl.cmd.ue, fl.cmd.source, *h->second.firing, "handed_over");
@@ -923,7 +943,6 @@ int main() {
           emit("{\"ev\":\"ran.ho_timeout\",\"id\":" + std::to_string(fl.cmd.id) + "}");
           cancels[fl.cmd.id] = Cancel{fl.cmd}; /* never committed: free the target */
           ul.forget({fl.cmd.target, fl.cmd.target_ue}); /* and its provisional alias */
-          home_of.erase({fl.cmd.target, fl.cmd.target_ue});
           it = flights.erase(it);
           continue;
         }
@@ -982,6 +1001,46 @@ int main() {
             nb.cells.size() < devourer::cell::kMaxNeighbours)
           nb.cells.push_back({ov.first, ov.second.rep.channel, ov.second.rep.phase_us});
       send(kv.second, f1::encode_neighbours(nb, mac));
+      /* Per-cell keys: the other cells' UEs' own area keys (Keys.h A_u, from
+       * the homes their DUs report), each wrapped for this DU under its cell
+       * key with a fresh nonce — what it checks a heard UE beacon with. */
+      if (master) {
+        const auto dk = devourer::cell::cell_key(master, kv.first);
+        const auto du_mac = dk ? hmac_sha1(*dk) : devourer::cell::Mac{};
+        f1::AreaKeys ak;
+        ak.du = kv.first;
+        ak.seq = next_seq();
+        auto add_area_key = [&](f1::AreaKeys &a, const devourer::cell::Mac &dm, uint16_t cell,
+                                uint16_t ue, const devourer::cell::HomeId &home) {
+          if (a.keys.size() >= f1::kMaxAreaKeys || !dm)
+            return;
+          for (const auto &e : a.keys)
+            if (e.cell == cell && e.ue == ue)
+              return; /* once per identity */
+          const auto uk = devourer::cell::home_key(master, home);
+          const auto au = uk ? devourer::cell::ue_area_key(hmac_sha1(*uk)) : std::nullopt;
+          const auto raw = au ? devourer::cell::key_from_hex(*au) : std::nullopt;
+          const uint64_t nonce = area_rng();
+          if (auto w = raw ? devourer::cell::wrap_area_key(dm, cell, ue, nonce, *raw) : std::nullopt)
+            a.keys.push_back({cell, ue, nonce, *w});
+        };
+        for (const auto &ov : dus) {
+          if (ov.first == kv.first || now - ov.second.at >= std::chrono::seconds(3))
+            continue;
+          for (const f1::UeHome &h : ov.second.rep.homes)
+            add_area_key(ak, du_mac, ov.first, h.ue, h.home);
+        }
+        /* A handover's TARGET identity as soon as its command exists: the
+         * source hears the UE under it right after the switch (its DAPS
+         * window), before the target's report names it. */
+        for (const auto &f : flights) {
+          const auto &cmd = f.second.cmd;
+          if (cmd.target != kv.first && cmd.target_pos != 0 &&
+              (cmd.home.joiner || cmd.home.cell != 0))
+            add_area_key(ak, du_mac, cmd.target, cmd.target_ue, cmd.home);
+        }
+        send(kv.second, f1::encode_area_keys(ak, mac));
+      }
     }
     /* The keepalive, every round and whatever the planning state: every DU
      * keeps its current schedule (a fresh sequence each send) while one

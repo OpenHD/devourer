@@ -506,11 +506,25 @@ holds what):
 - **The cell key** `K_c` tags everything that controls cell c's UEs: the
   grant map, the handover IE, the DL body, the UE beacon's own tag, the MR
   and the RACH. A compromised DU or UE of one cell can forge that cell only.
-- **The area key** `K_A` tags what *another* cell must check: the
-  neighbour list (the provenance of a measured neighbour beacon) and a
-  second, area tag on every UE beacon (v3). A neighbour DU checks that tag
-  before it counts a UE as heard or forwards it for DAPS; before, it took
-  "heard" from any frame with the right address.
+- **The area key** `K_A` tags the neighbour list, the provenance of a
+  measured neighbour beacon. With signed neighbour lists (below) a UE no
+  longer takes it as proof.
+- **The UE's own area key** `A_u = HMAC(K_u, 'V')` tags the second, area
+  tag on its beacon (v3). A neighbour DU checks that tag before it counts
+  the UE as heard or forwards it for DAPS; before, it took "heard" from any
+  frame with the right address.
+  - **Delivery:** the CU derives every `A_u` from the homes the DUs report.
+    Each plan round it sends every DU the other cells' UEs' keys (F1 v11
+    `AreaKeys`), each wrapped under that DU's cell key with a fresh nonce,
+    because F1 is authenticated but not encrypted.
+  - **Strict:** under per-cell keys a heard UE counts only with its own
+    key. One the DU has no key for is not counted.
+  - **The consequence of a wrong UE key:** such a UE is invisible to every
+    other DU, so coordination cannot keep another cell's UE off its slot.
+    On the rig, a UE holding another UE's key, on one channel with a
+    handover in flight, lost about 45 % of its uplinks to collisions with
+    cell 2's UE. A UE that cannot prove who it is gets no protection that
+    rests on its presence elsewhere.
 - **The UE key** `K_(c,u)` belongs to the UE's home identity.
 
 **The handover context.** The UE needs the target's key before the switch,
@@ -529,6 +543,27 @@ to take the target's grant maps.
 - **The CU follows a UE's home** across handovers (`home_of`), so a second
   handover still wraps for the UE's own key.
 
+**A RACH-joined UE's key, and where homes come from.** A joiner has no home
+(cell, UE) identity: its id comes from the join. Its UE key is therefore
+bound to the MAC it joins with (`CELL_JOINER_MAC`, or derived from host and
+radio).
+- **The key:** `K_j = HMAC(master, 'J' mac)`, provisioned out of band like a
+  SIM's (`CELL_UE_KEY`).
+- **Homes are the DUs' record:** a DU records every UE's home when it admits
+  it. A static UE gets its (cell, UE), a RACH joiner the authenticated MAC
+  it joined with, and a handover arrival the home its handover command
+  carries (F1 v10 `HoCommand::home`). The DU reports the homes of exactly the
+  UEs a report names, under the same lock (`Report.homes`).
+- **The CU keeps none of it:** it wraps each context for the home in the
+  *source* DU's current report. A restarted CU, or an id the DU has reused
+  for another UE, cannot select a stale home; every admission writes its
+  own. With no home reported there is no context, never a guessed key.
+- **A false MAC gains nothing:** a UE that joins claiming another's MAC
+  only gets contexts it cannot unwrap.
+- **The datagram bound:** both F1 receive buffers are `kMaxDatagram`
+  (8192). A report at every list bound is 3673 bytes, which the 2048-byte
+  buffers before this could already not hold.
+
 Without `CELL_AREA_KEY` all of this collapses to the one shared key, as
 before.
 
@@ -541,6 +576,72 @@ deriving every role's keys from one master; all pass).
 | a UE holding cell 2's key in cell 1 (a cell-2 insider forging cell 1) | 2 | 0 of 879 maps taken, never heard in slot; cell 2 unaffected |
 | a UE holding another UE's key | 2 | all 7 commands refused (no context), no switch, DU1 kept it (heard 100 %, in slot 99.8 %) |
 | coordination, "heard" from area-tagged UE beacons | 1 | `ran_coord_analyze` pass; both cells' UEs heard by the other DU |
+
+**Signed neighbour lists, per neighbour DU.** An HMAC tag a UE can check is
+one it could forge: with the area key, any UE could fake any cell's
+neighbour list, and with it which beacons count as that cell's. So each DU
+also signs its list with its own Ed25519 key (`src/cell/MeasGap.h`).
+- **What a DU airs:** its NL, an NS IE (the signature over the exact NL IE
+  bytes, 64 B) and an NC IE (its public key with the area CA's signature
+  over it: a certificate, 96 B). They ride every beacon; the budget check at
+  start counts them.
+- **What a UE holds:** only the CA's *public* key (`CELL_CA_PUB`). It
+  checks CA → cell key → NL (`NlVerifier`) and can forge nothing.
+- **Caching:** the UE verifies a certificate once per key and a list once per
+  content, then caches the exact verified bytes per cell. A beacon repeating
+  them costs a byte compare.
+- **Provisioning:** the DU signing seeds and the CA seed derive from the
+  master (`Keys.h`, two HMAC-SHA1 outputs to 32 bytes). The rig's Python
+  provisioning (testrig `scripts/cell_keys.py`) matches the C++ derivation
+  and OpenSSL's Ed25519 byte for byte.
+- **The residual** is the one any provenance has: a genuine beacon replayed.
+
+The rig result (testrig `scripts/m6_nlsign.sh`, per-cell keys and
+signing):
+| case | runs | result |
+|---|---|---|
+| both DUs certified | 2 | each UE reports the other cell in every measurement report (865–869 each); coordination passes |
+| DU2 holds the area key and every cell key but signs with a key the CA never certified | 2 | no UE ever counts a beacon of cell 2, not even its own UE (0 %); DU2 still serves that UE through its cell key, in slot 99.8 % |
+
+With signing on, the per-cell suite passes:
+- measurement-gap handover (the gap targets come from the UE's signed
+  serving list);
+- the emulated crossing;
+- DAPS;
+- phase planning;
+- the per-cell key set;
+- joiner keys;
+- per-UE area credentials.
+
+A shared-key handover passes too.
+
+**Per-UE area credentials** (testrig `scripts/m6_ueareakeys.sh`).
+Two co-channel cells under per-cell keys; all runs pass.
+
+| case | runs | result |
+|---|---|---|
+| each DU counts the other cell's UE as heard (plan edges 1/1, 2/1) from per-UE area tags | 2 | both edges; `ran_coord_analyze` pass |
+| UE1 holds the area key but a wrong UE key (so a wrong `A_u`) | 2 | DU2 never counts it as heard (no edge 1/1; UE2's 2/1 stays); DU1 still serves it, in slot 99.7–99.8 % |
+
+DAPS now forwards only by the handing-over UE's own area key: 0 uplinks
+missing, against 15 without DAPS. A source failure mid-crossing missed 0
+in the window, against 10 without. Joiner handover, the re-join and a
+shared-key handover also pass.
+
+**A joined UE's handover** (testrig `scripts/m6_joinerkeys.sh`).
+UE1 joins cell 1 through the RACH with a fixed joiner MAC, holding that
+MAC's `K_j`, under per-cell keys. It is handed over by the A3 at a −2 dB
+offset. All runs pass.
+
+| case | runs | result |
+|---|---|---|
+| the joiner hands over | 2 | joined as UE 2; the command's context is for its MAC (home `J:02cefeaabb01`); switch, target in slot 99.9 %, `ran.ho_done` |
+| the joiner holds another MAC's key | 2 | every command refused (6–7, no context), no switch; DU1 kept it (heard ≥ 99.9 %, in slot 100 %) |
+| a crossing there and back, the CU killed and restarted between the two handovers | 1 | 1 → 2 → 1; the restarted CU, knowing nothing, wrapped the return for the joiner (home `J:02cefeaabb01`, from DU2's report of the home the first command carried) |
+
+Regression for F1 v10: the static per-cell key set (handover, forge,
+isolate, coordination) and the re-join after a DU restart under per-cell
+keys both pass.
 
 **The M6 suite under per-cell keys** (`M5_MASTER`, 1 run of each; all pass):
 - inter-frequency handover and fallback;
@@ -772,14 +873,10 @@ superframe when there is nothing to serve.
   power. The uplink path loss stays the same, there is one UE, and the ramp
   rate is one setting (~2 dB/s of margin). No over-the-air motion,
   fading or crowd has been run.
-- **Per-cell context for joined UEs:** a RACH-joined UE has no provisioned
-  UE key, so the CU cannot wrap a context for it. Under per-cell keys it
-  refuses every handover command (`cell.ue.ho_no_context`) and stays in its
-  cell. Provisioning a key at the join, from the RACH exchange, is open.
-- **Area-key exposure:** anyone holding the area key can forge the
-  neighbour list and a UE beacon's area tag. That can fake measurement
-  provenance and "heard" or DAPS presence, but never a cell's control.
-  Per-UE area credentials are open.
+- **Unsigned neighbour lists:** without the signing material
+  (`CELL_NL_SIGN_KEY`, `CELL_NL_CERT`, `CELL_CA_PUB`), an area-key holder
+  can still forge a neighbour list, which is measurement provenance only.
+  With it, the residual is a genuine beacon replayed.
 - **Keyed rig runs only from the grant-map authentication on:** the
   handover, DAPS, inter-frequency, measurement-gap, phase-planning and
   clock-fit rig results above were run without `CELL_PSK`, an
